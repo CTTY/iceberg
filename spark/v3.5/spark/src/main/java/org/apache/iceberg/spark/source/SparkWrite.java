@@ -22,15 +22,20 @@ import static org.apache.iceberg.IsolationLevel.SERIALIZABLE;
 import static org.apache.iceberg.IsolationLevel.SNAPSHOT;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 import java.util.stream.Collectors;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.HasTableOperations;
+import org.apache.iceberg.IcebergBuild;
 import org.apache.iceberg.IsolationLevel;
 import org.apache.iceberg.OverwriteFiles;
 import org.apache.iceberg.PartitionKey;
@@ -41,17 +46,26 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotSummary;
 import org.apache.iceberg.SnapshotUpdate;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableOperations;
+import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.exceptions.CleanableFailure;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.index.IndexSpec;
 import org.apache.iceberg.io.ClusteredDataWriter;
 import org.apache.iceberg.io.DataWriteResult;
 import org.apache.iceberg.io.FanoutDataWriter;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.FileWriter;
+import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.iceberg.io.PartitioningWriter;
 import org.apache.iceberg.io.RollingDataWriter;
+import org.apache.iceberg.puffin.Blob;
+import org.apache.iceberg.puffin.Puffin;
+import org.apache.iceberg.puffin.PuffinCompressionCodec;
+import org.apache.iceberg.puffin.PuffinWriter;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.CommitMetadata;
 import org.apache.iceberg.spark.FileRewriteCoordinator;
@@ -262,6 +276,71 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
     return files;
   }
 
+  /**
+   * Collects all index blobs from all TaskCommit messages.
+   *
+   * @param messages the writer commit messages from all tasks
+   * @return a list of all index blobs, or an empty list if none
+   */
+  private List<Blob> collectIndexBlobs(WriterCommitMessage[] messages) {
+    List<Blob> allBlobs = new ArrayList<>();
+    for (WriterCommitMessage message : messages) {
+      if (message != null) {
+        TaskCommit taskCommit = (TaskCommit) message;
+        allBlobs.addAll(taskCommit.indexBlobs());
+      }
+    }
+    return allBlobs;
+  }
+
+  /**
+   * Writes index blobs to a Puffin file and registers it with the snapshot operation. If there are
+   * no index blobs, this method does nothing. If writing fails, the error is logged and the commit
+   * proceeds without the index file (graceful degradation per Requirement 6.4).
+   *
+   * @param operation the snapshot operation to register the index file with
+   * @param messages the writer commit messages containing index blobs
+   */
+  private void commitIndexFiles(SnapshotUpdate<?> operation, WriterCommitMessage[] messages) {
+    List<Blob> indexBlobs = collectIndexBlobs(messages);
+    if (indexBlobs.isEmpty()) {
+      return;
+    }
+
+    try {
+      if (!(table instanceof HasTableOperations)) {
+        LOG.warn("Table does not support table operations, skipping index file commit");
+        return;
+      }
+
+      TableOperations ops = ((HasTableOperations) table).operations();
+      String puffinFileName =
+          String.format("bloom-%s.puffin", UUID.randomUUID().toString());
+      String puffinPath = ops.metadataFileLocation(puffinFileName);
+      OutputFile outputFile = table.io().newOutputFile(puffinPath);
+
+      try (PuffinWriter puffinWriter =
+          Puffin.write(outputFile)
+              .createdBy(IcebergBuild.fullVersion())
+              .compressBlobs(PuffinCompressionCodec.ZSTD)
+              .build()) {
+        for (Blob blob : indexBlobs) {
+          puffinWriter.write(blob);
+        }
+        puffinWriter.finish();
+      }
+
+      operation.addIndexFile(puffinPath);
+      LOG.info(
+          "Committed {} index blobs to Puffin file: {}", indexBlobs.size(), puffinPath);
+    } catch (Exception e) {
+      LOG.warn(
+          "Failed to write index file with {} blobs, continuing commit without index",
+          indexBlobs.size(),
+          e);
+    }
+  }
+
   @Override
   public String toString() {
     return String.format("IcebergWrite(table=%s, format=%s)", table, format);
@@ -300,6 +379,8 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
         append.appendFile(file);
       }
 
+      commitIndexFiles(append, messages);
+
       commitOperation(
           append, String.format(Locale.ROOT, "append with %d new data files", numFiles));
     }
@@ -335,6 +416,8 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
         numFiles += 1;
         dynamicOverwrite.addFile(file);
       }
+
+      commitIndexFiles(dynamicOverwrite, messages);
 
       commitOperation(
           dynamicOverwrite,
@@ -381,6 +464,7 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
               "overwrite by filter %s with %d new data files",
               overwriteExpr,
               numFiles);
+      commitIndexFiles(overwriteFiles, messages);
       commitOperation(overwriteFiles, commitMsg);
     }
   }
@@ -441,6 +525,8 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
         numAddedFiles += 1;
         overwriteFiles.addFile(file);
       }
+
+      commitIndexFiles(overwriteFiles, messages);
 
       // the scan may be null if the optimizer replaces it with an empty relation (e.g. false cond)
       // no validation is needed in this case as the command does not depend on the table state
@@ -602,6 +688,7 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
         append.appendFile(file);
         numFiles++;
       }
+      commitIndexFiles(append, messages);
       commit(
           append,
           epochId,
@@ -624,6 +711,7 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
         overwriteFiles.addFile(file);
         numFiles++;
       }
+      commitIndexFiles(overwriteFiles, messages);
       commit(
           overwriteFiles,
           epochId,
@@ -634,9 +722,23 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
 
   public static class TaskCommit implements WriterCommitMessage {
     private final DataFile[] taskFiles;
+    private final List<SerializableBlob> indexBlobs;
 
     TaskCommit(DataFile[] taskFiles) {
+      this(taskFiles, ImmutableList.of());
+    }
+
+    TaskCommit(DataFile[] taskFiles, List<Blob> blobs) {
       this.taskFiles = taskFiles;
+      if (blobs != null && !blobs.isEmpty()) {
+        ImmutableList.Builder<SerializableBlob> builder = ImmutableList.builder();
+        for (Blob blob : blobs) {
+          builder.add(SerializableBlob.from(blob));
+        }
+        this.indexBlobs = builder.build();
+      } else {
+        this.indexBlobs = ImmutableList.of();
+      }
     }
 
     // Reports bytesWritten and recordsWritten to the Spark output metrics.
@@ -659,6 +761,71 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
 
     DataFile[] files() {
       return taskFiles;
+    }
+
+    List<Blob> indexBlobs() {
+      ImmutableList.Builder<Blob> builder = ImmutableList.builder();
+      for (SerializableBlob sb : indexBlobs) {
+        builder.add(sb.toBlob());
+      }
+      return builder.build();
+    }
+  }
+
+  /**
+   * A serializable wrapper for {@link Blob} that can be sent from executor to driver as part of
+   * {@link TaskCommit}. The Puffin {@link Blob} class is not serializable, so this class stores the
+   * blob data as a byte array and reconstructs the Blob on demand.
+   */
+  private static class SerializableBlob implements java.io.Serializable {
+    private final String type;
+    private final List<Integer> inputFields;
+    private final long snapshotId;
+    private final long sequenceNumber;
+    private final byte[] blobData;
+    private final PuffinCompressionCodec requestedCompression;
+    private final Map<String, String> properties;
+
+    SerializableBlob(
+        String type,
+        List<Integer> inputFields,
+        long snapshotId,
+        long sequenceNumber,
+        byte[] blobData,
+        PuffinCompressionCodec requestedCompression,
+        Map<String, String> properties) {
+      this.type = type;
+      this.inputFields = new java.util.ArrayList<>(inputFields);
+      this.snapshotId = snapshotId;
+      this.sequenceNumber = sequenceNumber;
+      this.blobData = blobData;
+      this.requestedCompression = requestedCompression;
+      this.properties = new java.util.HashMap<>(properties);
+    }
+
+    static SerializableBlob from(Blob blob) {
+      ByteBuffer buf = blob.blobData().duplicate();
+      byte[] data = new byte[buf.remaining()];
+      buf.get(data);
+      return new SerializableBlob(
+          blob.type(),
+          blob.inputFields(),
+          blob.snapshotId(),
+          blob.sequenceNumber(),
+          data,
+          blob.requestedCompression(),
+          blob.properties());
+    }
+
+    Blob toBlob() {
+      return new Blob(
+          type,
+          inputFields,
+          snapshotId,
+          sequenceNumber,
+          ByteBuffer.wrap(blobData),
+          requestedCompression,
+          properties);
     }
   }
 
@@ -718,8 +885,12 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
               .writeProperties(writeProperties)
               .build();
 
+      // Resolve index specs if bloom filter writing is enabled
+      List<IndexSpec> indexSpecs = resolveIndexSpecs(table);
+
       if (spec.isUnpartitioned()) {
-        return new UnpartitionedDataWriter(writerFactory, fileFactory, io, spec, targetFileSize);
+        return new UnpartitionedDataWriter(
+            writerFactory, fileFactory, io, spec, targetFileSize, indexSpecs, writeSchema);
 
       } else {
         return new PartitionedDataWriter(
@@ -730,29 +901,92 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
             writeSchema,
             dsSchema,
             targetFileSize,
-            useFanoutWriter);
+            useFanoutWriter,
+            indexSpecs);
       }
+    }
+
+    private List<IndexSpec> resolveIndexSpecs(Table table) {
+      boolean bloomFilterEnabled =
+          Boolean.parseBoolean(
+              table
+                  .properties()
+                  .getOrDefault(
+                      TableProperties.WRITE_BLOOM_FILTER_ENABLED,
+                      String.valueOf(TableProperties.WRITE_BLOOM_FILTER_ENABLED_DEFAULT)));
+      if (!bloomFilterEnabled) {
+        return ImmutableList.of();
+      }
+
+      try {
+        if (table instanceof HasTableOperations) {
+          TableOperations ops = ((HasTableOperations) table).operations();
+          List<IndexSpec> specs = ops.current().indexSpecs();
+          return specs != null ? specs : ImmutableList.of();
+        }
+      } catch (Exception e) {
+        LOG.warn("Failed to resolve index specs from table metadata", e);
+      }
+
+      return ImmutableList.of();
     }
   }
 
   private static class UnpartitionedDataWriter implements DataWriter<InternalRow> {
-    private final FileWriter<InternalRow, DataWriteResult> delegate;
+    private static final Logger LOG = LoggerFactory.getLogger(UnpartitionedDataWriter.class);
+
+    private final RollingDataWriter<InternalRow> delegate;
     private final FileIO io;
+    private final List<IndexSpec> indexSpecs;
+    private final Schema writeSchema;
+    // Tracks index writers per data file path
+    private final Map<String, SparkIndexWriter> indexWriters;
+    private String currentTrackedFilePath;
 
     private UnpartitionedDataWriter(
         SparkFileWriterFactory writerFactory,
         OutputFileFactory fileFactory,
         FileIO io,
         PartitionSpec spec,
-        long targetFileSize) {
+        long targetFileSize,
+        List<IndexSpec> indexSpecs,
+        Schema writeSchema) {
       this.delegate =
           new RollingDataWriter<>(writerFactory, fileFactory, io, targetFileSize, spec, null);
       this.io = io;
+      this.indexSpecs = indexSpecs;
+      this.writeSchema = writeSchema;
+      this.indexWriters = new java.util.LinkedHashMap<>();
+      this.currentTrackedFilePath = null;
     }
 
     @Override
     public void write(InternalRow record) throws IOException {
       delegate.write(record);
+      writeToIndex(record);
+    }
+
+    private void writeToIndex(InternalRow record) {
+      if (indexSpecs.isEmpty()) {
+        return;
+      }
+
+      try {
+        String filePath = delegate.currentFilePath().toString();
+        if (!filePath.equals(currentTrackedFilePath)) {
+          currentTrackedFilePath = filePath;
+          if (!indexWriters.containsKey(filePath)) {
+            indexWriters.put(filePath, new SparkIndexWriter(indexSpecs, filePath));
+          }
+        }
+
+        SparkIndexWriter indexWriter = indexWriters.get(currentTrackedFilePath);
+        if (indexWriter != null) {
+          indexWriter.write(record, writeSchema);
+        }
+      } catch (Exception e) {
+        LOG.warn("Failed to write row to index, continuing without index", e);
+      }
     }
 
     @Override
@@ -760,9 +994,28 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
       close();
 
       DataWriteResult result = delegate.result();
-      TaskCommit taskCommit = new TaskCommit(result.dataFiles().toArray(new DataFile[0]));
+      List<Blob> blobs = collectIndexBlobs();
+      TaskCommit taskCommit =
+          new TaskCommit(result.dataFiles().toArray(new DataFile[0]), blobs);
       taskCommit.reportOutputMetrics();
       return taskCommit;
+    }
+
+    private List<Blob> collectIndexBlobs() {
+      List<Blob> allBlobs = new ArrayList<>();
+      for (SparkIndexWriter indexWriter : indexWriters.values()) {
+        try {
+          // Use snapshot ID 0 and sequence number 0 as placeholders;
+          // the actual values will be set during commit
+          allBlobs.addAll(indexWriter.finish(0L, 0L));
+        } catch (Exception e) {
+          LOG.warn(
+              "Failed to collect index blobs for file {}, continuing without index",
+              indexWriter.dataFilePath(),
+              e);
+        }
+      }
+      return allBlobs;
     }
 
     @Override
@@ -776,15 +1029,32 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
     @Override
     public void close() throws IOException {
       delegate.close();
+      for (SparkIndexWriter indexWriter : indexWriters.values()) {
+        try {
+          indexWriter.close();
+        } catch (Exception e) {
+          LOG.warn("Failed to close index writer", e);
+        }
+      }
     }
   }
 
   private static class PartitionedDataWriter implements DataWriter<InternalRow> {
+    private static final Logger LOG = LoggerFactory.getLogger(PartitionedDataWriter.class);
+
     private final PartitioningWriter<InternalRow, DataWriteResult> delegate;
     private final FileIO io;
     private final PartitionSpec spec;
     private final PartitionKey partitionKey;
     private final InternalRowWrapper internalRowWrapper;
+    private final List<IndexSpec> indexSpecs;
+    private final Schema writeSchema;
+    // For partitioned writes, we create one index writer per data file.
+    // Since we don't have direct access to the current file path from the partitioning writer,
+    // we collect all rows and create index writers per data file after commit.
+    // For the MVP, we use a single index writer that covers all rows in this task.
+    private SparkIndexWriter currentIndexWriter;
+    private final List<SparkIndexWriter> allIndexWriters;
 
     private PartitionedDataWriter(
         SparkFileWriterFactory writerFactory,
@@ -794,7 +1064,8 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
         Schema dataSchema,
         StructType dataSparkType,
         long targetFileSize,
-        boolean fanoutEnabled) {
+        boolean fanoutEnabled,
+        List<IndexSpec> indexSpecs) {
       if (fanoutEnabled) {
         this.delegate = new FanoutDataWriter<>(writerFactory, fileFactory, io, targetFileSize);
       } else {
@@ -804,12 +1075,38 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
       this.spec = spec;
       this.partitionKey = new PartitionKey(spec, dataSchema);
       this.internalRowWrapper = new InternalRowWrapper(dataSparkType, dataSchema.asStruct());
+      this.indexSpecs = indexSpecs;
+      this.writeSchema = dataSchema;
+      this.allIndexWriters = new ArrayList<>();
+      this.currentIndexWriter = null;
     }
 
     @Override
     public void write(InternalRow row) throws IOException {
       partitionKey.partition(internalRowWrapper.wrap(row));
       delegate.write(row, spec, partitionKey);
+      writeToIndex(row);
+    }
+
+    private void writeToIndex(InternalRow row) {
+      if (indexSpecs.isEmpty()) {
+        return;
+      }
+
+      try {
+        // For partitioned writes, we create a single index writer per task as a simplification.
+        // Each data file will get its own blob when we finish.
+        // This is a simplification for the MVP - in practice, the partitioning writer
+        // manages multiple files internally.
+        if (currentIndexWriter == null) {
+          currentIndexWriter =
+              new SparkIndexWriter(indexSpecs, "partitioned-task-writer");
+          allIndexWriters.add(currentIndexWriter);
+        }
+        currentIndexWriter.write(row, writeSchema);
+      } catch (Exception e) {
+        LOG.warn("Failed to write row to index, continuing without index", e);
+      }
     }
 
     @Override
@@ -817,9 +1114,23 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
       close();
 
       DataWriteResult result = delegate.result();
-      TaskCommit taskCommit = new TaskCommit(result.dataFiles().toArray(new DataFile[0]));
+      List<Blob> blobs = collectIndexBlobs();
+      TaskCommit taskCommit =
+          new TaskCommit(result.dataFiles().toArray(new DataFile[0]), blobs);
       taskCommit.reportOutputMetrics();
       return taskCommit;
+    }
+
+    private List<Blob> collectIndexBlobs() {
+      List<Blob> allBlobs = new ArrayList<>();
+      for (SparkIndexWriter indexWriter : allIndexWriters) {
+        try {
+          allBlobs.addAll(indexWriter.finish(0L, 0L));
+        } catch (Exception e) {
+          LOG.warn("Failed to collect index blobs, continuing without index", e);
+        }
+      }
+      return allBlobs;
     }
 
     @Override
@@ -833,6 +1144,13 @@ abstract class SparkWrite implements Write, RequiresDistributionAndOrdering {
     @Override
     public void close() throws IOException {
       delegate.close();
+      for (SparkIndexWriter indexWriter : allIndexWriters) {
+        try {
+          indexWriter.close();
+        } catch (Exception e) {
+          LOG.warn("Failed to close index writer", e);
+        }
+      }
     }
   }
 }

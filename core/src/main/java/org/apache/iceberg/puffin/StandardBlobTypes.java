@@ -29,4 +29,8 @@ public final class StandardBlobTypes {
 
   /** A serialized deletion vector according to the Iceberg spec */
   public static final String DV_V1 = "deletion-vector-v1";
+
+  /** A serialized Bloom filter for column-level secondary indexing */
+  public static final String BLOOM_FILTER_V1 = "bloom-filter-v1";
+
 }

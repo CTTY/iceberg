@@ -140,6 +140,7 @@ public class RewriteTablePathUtil {
         updatePathInStatisticsFiles(metadata.statisticsFiles(), sourcePrefix, targetPrefix),
         updatePathInPartitionStatisticsFiles(
             metadata.partitionStatisticsFiles(), sourcePrefix, targetPrefix),
+        metadata.indexSpecs(),
         metadata.nextRowId(),
         metadata.encryptionKeys(),
         metadata.changes());
@@ -241,7 +242,10 @@ public class RewriteTablePathUtil {
               newManifestListLocation,
               snapshot.firstRowId(),
               snapshot.addedRows(),
-              snapshot.keyId());
+              snapshot.keyId(),
+              snapshot.indexFiles().stream()
+                  .map(p -> newPath(p, sourcePrefix, targetPrefix))
+                  .collect(java.util.stream.Collectors.toList()));
       newSnapshots.add(newSnapshot);
     }
     return newSnapshots;

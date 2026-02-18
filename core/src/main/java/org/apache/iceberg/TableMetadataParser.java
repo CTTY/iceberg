@@ -40,6 +40,8 @@ import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.index.IndexSpec;
+import org.apache.iceberg.index.IndexSpecParser;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -111,6 +113,7 @@ public class TableMetadataParser {
   static final String METADATA_LOG = "metadata-log";
   static final String STATISTICS = "statistics";
   static final String PARTITION_STATISTICS = "partition-statistics";
+  static final String INDEX_SPECS = "index-specs";
   static final String ENCRYPTION_KEYS = "encryption-keys";
   static final String NEXT_ROW_ID = "next-row-id";
   static final int MIN_NULL_CURRENT_SNAPSHOT_VERSION = 3;
@@ -256,6 +259,12 @@ public class TableMetadataParser {
     generator.writeArrayFieldStart(PARTITION_STATISTICS);
     for (PartitionStatisticsFile partitionStatisticsFile : metadata.partitionStatisticsFiles()) {
       PartitionStatisticsFileParser.toJson(partitionStatisticsFile, generator);
+    }
+    generator.writeEndArray();
+
+    generator.writeArrayFieldStart(INDEX_SPECS);
+    for (IndexSpec indexSpec : metadata.indexSpecs()) {
+      IndexSpecParser.toJson(indexSpec, generator);
     }
     generator.writeEndArray();
 
@@ -530,6 +539,13 @@ public class TableMetadataParser {
       partitionStatisticsFiles = ImmutableList.of();
     }
 
+    List<IndexSpec> indexSpecs;
+    if (node.has(INDEX_SPECS)) {
+      indexSpecs = indexSpecsFromJson(node.get(INDEX_SPECS));
+    } else {
+      indexSpecs = ImmutableList.of();
+    }
+
     ImmutableList.Builder<HistoryEntry> entries = ImmutableList.builder();
     if (node.has(SNAPSHOT_LOG)) {
       Iterator<JsonNode> logIterator = node.get(SNAPSHOT_LOG).elements();
@@ -578,6 +594,7 @@ public class TableMetadataParser {
         refs,
         statisticsFiles,
         partitionStatisticsFiles,
+        indexSpecs,
         lastRowId,
         keys,
         ImmutableList.of() /* no changes from the file */);
@@ -626,5 +643,19 @@ public class TableMetadataParser {
     }
 
     return statsFileBuilder.build();
+  }
+
+  private static List<IndexSpec> indexSpecsFromJson(JsonNode indexSpecsList) {
+    Preconditions.checkArgument(
+        indexSpecsList.isArray(),
+        "Cannot parse index specs from non-array: %s",
+        indexSpecsList);
+
+    ImmutableList.Builder<IndexSpec> indexSpecsBuilder = ImmutableList.builder();
+    for (JsonNode indexSpecNode : indexSpecsList) {
+      indexSpecsBuilder.add(IndexSpecParser.fromJson(indexSpecNode));
+    }
+
+    return indexSpecsBuilder.build();
   }
 }

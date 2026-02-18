@@ -76,4 +76,15 @@ public interface SnapshotUpdate<ThisT> extends PendingUpdate<Snapshot> {
     throw new UnsupportedOperationException(
         "Snapshot validation not supported by " + this.getClass().getName());
   }
+
+  /**
+   * Adds an index file path to be included in the next snapshot. The path will be appended to any
+   * index files inherited from the parent snapshot.
+   *
+   * @param path the path to the index file (e.g., a Puffin file containing Bloom filter blobs)
+   */
+  default void addIndexFile(String path) {
+    throw new UnsupportedOperationException(
+        "Index files not supported by " + this.getClass().getName());
+  }
 }

@@ -378,4 +378,12 @@ public class SparkReadConf {
         .defaultValue(SparkSQLProperties.PARQUET_READER_TYPE_DEFAULT)
         .parse();
   }
+
+  public boolean bloomFilterReadEnabled() {
+    return confParser
+        .booleanConf()
+        .tableProperty(TableProperties.READ_BLOOM_FILTER_ENABLED)
+        .defaultValue(TableProperties.READ_BLOOM_FILTER_ENABLED_DEFAULT)
+        .parse();
+  }
 }

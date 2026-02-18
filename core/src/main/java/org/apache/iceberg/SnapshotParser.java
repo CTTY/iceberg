@@ -22,6 +22,7 @@ import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.io.IOException;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
@@ -54,6 +55,7 @@ public class SnapshotParser {
   private static final String FIRST_ROW_ID = "first-row-id";
   private static final String ADDED_ROWS = "added-rows";
   private static final String KEY_ID = "key-id";
+  private static final String INDEX_FILES = "index-files";
 
   static void toJson(Snapshot snapshot, JsonGenerator generator) throws IOException {
     generator.writeStartObject();
@@ -108,6 +110,10 @@ public class SnapshotParser {
     }
 
     JsonUtil.writeStringFieldIfPresent(KEY_ID, snapshot.keyId(), generator);
+
+    if (snapshot.indexFiles() != null && !snapshot.indexFiles().isEmpty()) {
+      JsonUtil.writeStringArray(INDEX_FILES, snapshot.indexFiles(), generator);
+    }
 
     generator.writeEndObject();
   }
@@ -176,6 +182,8 @@ public class SnapshotParser {
 
     String keyId = JsonUtil.getStringOrNull(KEY_ID, node);
 
+    List<String> indexFiles = JsonUtil.getStringListOrNull(INDEX_FILES, node);
+
     if (node.has(MANIFEST_LIST)) {
       // the manifest list is stored in a manifest list file
       String manifestList = JsonUtil.getString(MANIFEST_LIST, node);
@@ -190,7 +198,8 @@ public class SnapshotParser {
           manifestList,
           firstRowId,
           addedRows,
-          keyId);
+          keyId,
+          indexFiles);
 
     } else {
       // fall back to an embedded manifest list. pass in the manifest's InputFile so length can be

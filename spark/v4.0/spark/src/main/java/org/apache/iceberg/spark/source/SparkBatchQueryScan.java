@@ -43,6 +43,7 @@ import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.ExpressionUtil;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.expressions.Projections;
+import org.apache.iceberg.index.IndexFilePruner;
 import org.apache.iceberg.metrics.ScanReport;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -67,12 +68,14 @@ class SparkBatchQueryScan extends SparkPartitioningAwareScan<PartitionScanTask>
 
   private static final Logger LOG = LoggerFactory.getLogger(SparkBatchQueryScan.class);
 
+  private final SparkReadConf readConf;
   private final Long snapshotId;
   private final Long startSnapshotId;
   private final Long endSnapshotId;
   private final Long asOfTimestamp;
   private final String tag;
   private final List<Expression> runtimeFilterExpressions;
+  private volatile boolean bloomFilterPruningApplied;
 
   SparkBatchQueryScan(
       SparkSession spark,
@@ -84,12 +87,14 @@ class SparkBatchQueryScan extends SparkPartitioningAwareScan<PartitionScanTask>
       Supplier<ScanReport> scanReportSupplier) {
     super(spark, table, scan, readConf, expectedSchema, filters, scanReportSupplier);
 
+    this.readConf = readConf;
     this.snapshotId = readConf.snapshotId();
     this.startSnapshotId = readConf.startSnapshotId();
     this.endSnapshotId = readConf.endSnapshotId();
     this.asOfTimestamp = readConf.asOfTimestamp();
     this.tag = readConf.tag();
     this.runtimeFilterExpressions = Lists.newArrayList();
+    this.bloomFilterPruningApplied = false;
   }
 
   Long snapshotId() {
@@ -99,6 +104,131 @@ class SparkBatchQueryScan extends SparkPartitioningAwareScan<PartitionScanTask>
   @Override
   protected Class<PartitionScanTask> taskJavaClass() {
     return PartitionScanTask.class;
+  }
+
+  @Override
+  protected synchronized List<PartitionScanTask> tasks() {
+    List<PartitionScanTask> plannedTasks = super.tasks();
+
+    if (!bloomFilterPruningApplied) {
+      bloomFilterPruningApplied = true;
+      List<PartitionScanTask> prunedTasks = applyBloomFilterPruning(plannedTasks);
+      if (prunedTasks.size() < plannedTasks.size()) {
+        resetTasks(prunedTasks);
+        return prunedTasks;
+      }
+    }
+
+    return plannedTasks;
+  }
+
+  /**
+   * Applies Bloom filter index pruning to the given tasks. This runs after partition pruning and
+   * min/max statistics pruning have already been applied by the core scan planning.
+   *
+   * <p>Pruning is skipped when:
+   *
+   * <ul>
+   *   <li>{@code read.bloom-filter.enabled} is false
+   *   <li>No snapshot is available
+   *   <li>The snapshot has no index files
+   *   <li>No filter expressions are present
+   * </ul>
+   *
+   * <p>All errors are handled with fail-safe behavior: if anything goes wrong during index loading
+   * or evaluation, the original tasks are returned unchanged.
+   */
+  private List<PartitionScanTask> applyBloomFilterPruning(List<PartitionScanTask> tasks) {
+    if (!readConf.bloomFilterReadEnabled()) {
+      return tasks;
+    }
+
+    if (tasks.isEmpty()) {
+      return tasks;
+    }
+
+    Snapshot snapshot = resolveSnapshot();
+    if (snapshot == null) {
+      return tasks;
+    }
+
+    List<String> indexFiles = snapshot.indexFiles();
+    if (indexFiles == null || indexFiles.isEmpty()) {
+      return tasks;
+    }
+
+    Expression filter =
+        filterExpressions().stream().reduce(Expressions.alwaysTrue(), Expressions::and);
+    if (filter == Expressions.alwaysTrue()) {
+      return tasks;
+    }
+
+    try {
+      IndexFilePruner pruner = IndexFilePruner.load(indexFiles, table().io());
+      if (pruner.isEmpty()) {
+        return tasks;
+      }
+
+      // Convert PartitionScanTasks to FileScanTasks for the pruner
+      List<FileScanTask> fileScanTasks =
+          tasks.stream().map(ScanTask::asFileScanTask).collect(Collectors.toList());
+
+      List<FileScanTask> prunedFileTasks =
+          pruner.pruneFiles(fileScanTasks, filter, table().schema());
+
+      // Build a set of kept file paths for filtering the original PartitionScanTasks
+      Set<String> keptFilePaths =
+          prunedFileTasks.stream()
+              .map(task -> task.file().location())
+              .collect(Collectors.toSet());
+
+      List<PartitionScanTask> result =
+          tasks.stream()
+              .filter(
+                  task -> keptFilePaths.contains(task.asFileScanTask().file().location()))
+              .collect(Collectors.toList());
+
+      int pruned = pruner.filesPruned();
+      if (pruned > 0) {
+        LOG.info(
+            "Bloom filter index pruning: pruned {} of {} file(s) for table {}",
+            pruned,
+            tasks.size(),
+            table().name());
+      }
+
+      return result;
+    } catch (Exception e) {
+      LOG.warn(
+          "Failed to apply Bloom filter pruning for table {}, proceeding without pruning",
+          table().name(),
+          e);
+      return tasks;
+    }
+  }
+
+  /**
+   * Resolves the snapshot to use for index file loading, following the same logic as {@link
+   * #estimateStatistics()}.
+   */
+  private Snapshot resolveSnapshot() {
+    try {
+      if (snapshotId != null) {
+        return table().snapshot(snapshotId);
+      } else if (asOfTimestamp != null) {
+        long resolvedId = SnapshotUtil.snapshotIdAsOfTime(table(), asOfTimestamp);
+        return table().snapshot(resolvedId);
+      } else if (branch() != null) {
+        return table().snapshot(branch());
+      } else if (tag != null) {
+        return table().snapshot(tag);
+      } else {
+        return table().currentSnapshot();
+      }
+    } catch (Exception e) {
+      LOG.warn("Failed to resolve snapshot for index pruning", e);
+      return null;
+    }
   }
 
   @Override

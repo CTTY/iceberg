@@ -124,6 +124,7 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
   private ExecutorService workerPool;
   private String targetBranch = SnapshotRef.MAIN_BRANCH;
   private CommitMetrics commitMetrics;
+  private final List<String> pendingIndexFiles = Lists.newArrayList();
 
   protected SnapshotProducer(TableOperations ops) {
     this.ops = ops;
@@ -210,6 +211,18 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
 
   protected String targetBranch() {
     return targetBranch;
+  }
+
+  /**
+   * Adds an index file path to be included in the next snapshot. The path will be appended to any
+   * index files inherited from the parent snapshot.
+   *
+   * @param path the path to the index file (e.g., a Puffin file containing Bloom filter blobs)
+   */
+  @Override
+  public void addIndexFile(String path) {
+    Preconditions.checkArgument(path != null, "Invalid index file path: null");
+    pendingIndexFiles.add(path);
   }
 
   protected ExecutorService workerPool() {
@@ -342,7 +355,27 @@ abstract class SnapshotProducer<ThisT> implements SnapshotUpdate<ThisT> {
         manifestList.location(),
         nextRowId,
         assignedRows,
-        writer.toManifestListFile().encryptionKeyID());
+        writer.toManifestListFile().encryptionKeyID(),
+        accumulateIndexFiles(parentSnapshot));
+  }
+
+  /**
+   * Builds the accumulated list of index files for the new snapshot. Inherits all index files from
+   * the parent snapshot and appends any new index files added via {@link #addIndexFile(String)}.
+   */
+  private List<String> accumulateIndexFiles(Snapshot parentSnapshot) {
+    List<String> inherited =
+        parentSnapshot != null ? parentSnapshot.indexFiles() : ImmutableList.of();
+
+    if (inherited.isEmpty() && pendingIndexFiles.isEmpty()) {
+      return ImmutableList.of();
+    }
+
+    ImmutableList.Builder<String> builder =
+        ImmutableList.builderWithExpectedSize(inherited.size() + pendingIndexFiles.size());
+    builder.addAll(inherited);
+    builder.addAll(pendingIndexFiles);
+    return builder.build();
   }
 
   private void runValidations(Snapshot parentSnapshot) {

@@ -46,6 +46,7 @@ class BaseSnapshot implements Snapshot {
   private final Long firstRowId;
   private final Long addedRows;
   private final String keyId;
+  private final List<String> indexFiles;
 
   // lazily initialized
   private transient List<ManifestFile> allManifests = null;
@@ -68,6 +69,34 @@ class BaseSnapshot implements Snapshot {
       Long firstRowId,
       Long addedRows,
       String keyId) {
+    this(
+        sequenceNumber,
+        snapshotId,
+        parentId,
+        timestampMillis,
+        operation,
+        summary,
+        schemaId,
+        manifestList,
+        firstRowId,
+        addedRows,
+        keyId,
+        null);
+  }
+
+  BaseSnapshot(
+      long sequenceNumber,
+      long snapshotId,
+      Long parentId,
+      long timestampMillis,
+      String operation,
+      Map<String, String> summary,
+      Integer schemaId,
+      String manifestList,
+      Long firstRowId,
+      Long addedRows,
+      String keyId,
+      List<String> indexFiles) {
     Preconditions.checkArgument(
         firstRowId == null || firstRowId >= 0,
         "Invalid first-row-id (cannot be negative): %s",
@@ -91,6 +120,7 @@ class BaseSnapshot implements Snapshot {
     this.firstRowId = firstRowId;
     this.addedRows = firstRowId != null ? addedRows : null;
     this.keyId = keyId;
+    this.indexFiles = indexFiles != null ? ImmutableList.copyOf(indexFiles) : ImmutableList.of();
   }
 
   BaseSnapshot(
@@ -114,6 +144,7 @@ class BaseSnapshot implements Snapshot {
     this.firstRowId = null;
     this.addedRows = null;
     this.keyId = null;
+    this.indexFiles = ImmutableList.of();
   }
 
   @Override
@@ -164,6 +195,11 @@ class BaseSnapshot implements Snapshot {
   @Override
   public String keyId() {
     return keyId;
+  }
+
+  @Override
+  public List<String> indexFiles() {
+    return indexFiles;
   }
 
   private void cacheManifests(FileIO fileIO) {
@@ -360,6 +396,7 @@ class BaseSnapshot implements Snapshot {
         .add("summary", summary)
         .add("manifest-list", manifestListLocation)
         .add("schema-id", schemaId)
+        .add("index-files", indexFiles)
         .toString();
   }
 }

@@ -206,4 +206,17 @@ public interface Snapshot extends Serializable {
   default String keyId() {
     return null;
   }
+
+  /**
+   * Return the list of index file paths (e.g., Puffin files) associated with this snapshot.
+   *
+   * <p>Index files contain secondary index data such as Bloom filters that can be used for file
+   * pruning during scan planning.
+   *
+   * @return a list of index file paths, or an empty list if no index files are associated
+   */
+  default List<String> indexFiles() {
+    return java.util.Collections.emptyList();
+  }
+
 }

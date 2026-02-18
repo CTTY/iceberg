@@ -394,4 +394,10 @@ public class TableProperties {
   public static final int ENCRYPTION_DEK_LENGTH_DEFAULT = 16;
 
   public static final int ENCRYPTION_AAD_LENGTH_DEFAULT = 16;
+
+  public static final String WRITE_BLOOM_FILTER_ENABLED = "write.bloom-filter.enabled";
+  public static final boolean WRITE_BLOOM_FILTER_ENABLED_DEFAULT = true;
+
+  public static final String READ_BLOOM_FILTER_ENABLED = "read.bloom-filter.enabled";
+  public static final boolean READ_BLOOM_FILTER_ENABLED_DEFAULT = true;
 }

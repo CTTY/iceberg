@@ -320,4 +320,89 @@ public class TestSnapshotJson {
             currentMs);
     assertThat(SnapshotParser.toJson(snap)).isEqualTo(expected);
   }
+  @Test
+  public void testJsonConversionWithIndexFiles() throws IOException {
+    int snapshotId = 23;
+    Long parentId = null;
+    String manifestList = createManifestListWithManifestFiles(snapshotId, parentId);
+    List<String> indexFiles =
+        ImmutableList.of(
+            "s3://bucket/table/metadata/bloom-snap123-0.puffin",
+            "s3://bucket/table/metadata/bloom-snap456-0.puffin");
+
+    Snapshot expected =
+        new BaseSnapshot(
+            0,
+            snapshotId,
+            parentId,
+            System.currentTimeMillis(),
+            null,
+            null,
+            null,
+            manifestList,
+            null,
+            null,
+            null,
+            indexFiles);
+    String json = SnapshotParser.toJson(expected);
+    Snapshot snapshot = SnapshotParser.fromJson(json);
+
+    assertThat(snapshot.snapshotId()).isEqualTo(expected.snapshotId());
+    assertThat(snapshot.indexFiles()).isEqualTo(indexFiles);
+  }
+
+  @Test
+  public void testJsonConversionWithoutIndexFiles() throws IOException {
+    int snapshotId = 23;
+    Long parentId = null;
+    String manifestList = createManifestListWithManifestFiles(snapshotId, parentId);
+
+    Snapshot expected =
+        new BaseSnapshot(
+            0,
+            snapshotId,
+            parentId,
+            System.currentTimeMillis(),
+            null,
+            null,
+            null,
+            manifestList,
+            null,
+            null,
+            null);
+    String json = SnapshotParser.toJson(expected);
+    Snapshot snapshot = SnapshotParser.fromJson(json);
+
+    assertThat(snapshot.snapshotId()).isEqualTo(expected.snapshotId());
+    assertThat(snapshot.indexFiles()).isEmpty();
+  }
+
+  @Test
+  public void testJsonConversionWithEmptyIndexFiles() throws IOException {
+    int snapshotId = 23;
+    Long parentId = null;
+    String manifestList = createManifestListWithManifestFiles(snapshotId, parentId);
+
+    Snapshot expected =
+        new BaseSnapshot(
+            0,
+            snapshotId,
+            parentId,
+            System.currentTimeMillis(),
+            null,
+            null,
+            null,
+            manifestList,
+            null,
+            null,
+            null,
+            ImmutableList.of());
+    String json = SnapshotParser.toJson(expected);
+
+    // empty index-files should not be serialized
+    assertThat(json).doesNotContain("index-files");
+
+    Snapshot snapshot = SnapshotParser.fromJson(json);
+    assertThat(snapshot.indexFiles()).isEmpty();
+  }
 }

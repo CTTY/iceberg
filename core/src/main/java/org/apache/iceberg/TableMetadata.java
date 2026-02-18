@@ -33,6 +33,7 @@ import java.util.stream.Stream;
 import org.apache.iceberg.encryption.EncryptedKey;
 import org.apache.iceberg.encryption.EncryptionUtil;
 import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.index.IndexSpec;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.base.Objects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -263,6 +264,7 @@ public class TableMetadata implements Serializable {
   private final List<MetadataLogEntry> previousFiles;
   private final List<StatisticsFile> statisticsFiles;
   private final List<PartitionStatisticsFile> partitionStatisticsFiles;
+  private final List<IndexSpec> indexSpecs;
   private final List<MetadataUpdate> changes;
   private final long nextRowId;
   private final List<EncryptedKey> encryptionKeys;
@@ -297,6 +299,7 @@ public class TableMetadata implements Serializable {
       Map<String, SnapshotRef> refs,
       List<StatisticsFile> statisticsFiles,
       List<PartitionStatisticsFile> partitionStatisticsFiles,
+      List<IndexSpec> indexSpecs,
       long nextRowId,
       List<EncryptedKey> encryptionKeys,
       List<MetadataUpdate> changes) {
@@ -353,6 +356,7 @@ public class TableMetadata implements Serializable {
     this.refs = validateRefs(currentSnapshotId, refs, snapshotsById);
     this.statisticsFiles = ImmutableList.copyOf(statisticsFiles);
     this.partitionStatisticsFiles = ImmutableList.copyOf(partitionStatisticsFiles);
+    this.indexSpecs = ImmutableList.copyOf(indexSpecs);
 
     // row lineage
     this.nextRowId = nextRowId;
@@ -561,6 +565,10 @@ public class TableMetadata implements Serializable {
 
   public List<PartitionStatisticsFile> partitionStatisticsFiles() {
     return partitionStatisticsFiles;
+  }
+
+  public List<IndexSpec> indexSpecs() {
+    return indexSpecs;
   }
 
   public List<HistoryEntry> snapshotLog() {
@@ -916,6 +924,7 @@ public class TableMetadata implements Serializable {
     private final Map<String, SnapshotRef> refs;
     private final Map<Long, List<StatisticsFile>> statisticsFiles;
     private final Map<Long, List<PartitionStatisticsFile>> partitionStatisticsFiles;
+    private final List<IndexSpec> indexSpecs;
     private boolean suppressHistoricalSnapshots = false;
     private long nextRowId;
     private final List<EncryptedKey> encryptionKeys;
@@ -963,6 +972,7 @@ public class TableMetadata implements Serializable {
       this.refs = Maps.newHashMap();
       this.statisticsFiles = Maps.newHashMap();
       this.partitionStatisticsFiles = Maps.newHashMap();
+      this.indexSpecs = Lists.newArrayList();
       this.snapshotsById = Maps.newHashMap();
       this.schemasById = Maps.newHashMap();
       this.specsById = Maps.newHashMap();
@@ -999,6 +1009,7 @@ public class TableMetadata implements Serializable {
       this.refs = Maps.newHashMap(base.refs);
       this.statisticsFiles = indexStatistics(base.statisticsFiles);
       this.partitionStatisticsFiles = indexPartitionStatistics(base.partitionStatisticsFiles);
+      this.indexSpecs = Lists.newArrayList(base.indexSpecs);
       this.snapshotsById = Maps.newHashMap(base.snapshotsById);
       this.schemasById = Maps.newHashMap(base.schemasById);
       this.specsById = Maps.newHashMap(base.specsById);
@@ -1404,6 +1415,19 @@ public class TableMetadata implements Serializable {
       return this;
     }
 
+    public Builder addIndexSpec(IndexSpec indexSpec) {
+      Preconditions.checkNotNull(indexSpec, "indexSpec is null");
+      indexSpecs.add(indexSpec);
+      return this;
+    }
+
+    public Builder setIndexSpecs(List<IndexSpec> newIndexSpecs) {
+      Preconditions.checkNotNull(newIndexSpecs, "indexSpecs is null");
+      indexSpecs.clear();
+      indexSpecs.addAll(newIndexSpecs);
+      return this;
+    }
+
     public Builder removeSnapshots(List<Snapshot> snapshotsToRemove) {
       Set<Long> idsToRemove =
           snapshotsToRemove.stream().map(Snapshot::snapshotId).collect(Collectors.toSet());
@@ -1590,6 +1614,7 @@ public class TableMetadata implements Serializable {
           partitionStatisticsFiles.values().stream()
               .flatMap(List::stream)
               .collect(Collectors.toList()),
+          ImmutableList.copyOf(indexSpecs),
           nextRowId,
           encryptionKeys,
           discardChanges ? ImmutableList.of() : ImmutableList.copyOf(changes));

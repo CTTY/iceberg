@@ -158,4 +158,59 @@ public class TestSnapshotProducer extends TestBase {
     // Verify the table wasn't updated
     assertThat(table.snapshots()).hasSize(1);
   }
+
+  @TestTemplate
+  public void testIndexFilesAccumulationFromParentSnapshot() {
+    // First commit: add a data file and an index file
+    SnapshotProducer<?> append1 = (SnapshotProducer<?>) table.newFastAppend().appendFile(FILE_A);
+    append1.addIndexFile("s3://bucket/table/metadata/bloom-snap1.puffin");
+    append1.commit();
+
+    Snapshot snapshot1 = table.currentSnapshot();
+    assertThat(snapshot1.indexFiles())
+        .containsExactly("s3://bucket/table/metadata/bloom-snap1.puffin");
+
+    // Second commit: add another data file and index file; should inherit from parent
+    SnapshotProducer<?> append2 = (SnapshotProducer<?>) table.newFastAppend().appendFile(FILE_B);
+    append2.addIndexFile("s3://bucket/table/metadata/bloom-snap2.puffin");
+    append2.commit();
+
+    Snapshot snapshot2 = table.currentSnapshot();
+    assertThat(snapshot2.indexFiles())
+        .containsExactly(
+            "s3://bucket/table/metadata/bloom-snap1.puffin",
+            "s3://bucket/table/metadata/bloom-snap2.puffin");
+  }
+
+  @TestTemplate
+  public void testIndexFilesEmptyWhenNoneAdded() {
+    // Commit without adding any index files
+    table.newFastAppend().appendFile(FILE_A).commit();
+
+    Snapshot snapshot = table.currentSnapshot();
+    assertThat(snapshot.indexFiles()).isEmpty();
+  }
+
+  @TestTemplate
+  public void testIndexFilesInheritedWithoutNewAdditions() {
+    // First commit with an index file
+    SnapshotProducer<?> append1 = (SnapshotProducer<?>) table.newFastAppend().appendFile(FILE_A);
+    append1.addIndexFile("s3://bucket/table/metadata/bloom-snap1.puffin");
+    append1.commit();
+
+    // Second commit without adding new index files; should still inherit
+    table.newFastAppend().appendFile(FILE_B).commit();
+
+    Snapshot snapshot2 = table.currentSnapshot();
+    assertThat(snapshot2.indexFiles())
+        .containsExactly("s3://bucket/table/metadata/bloom-snap1.puffin");
+  }
+
+  @TestTemplate
+  public void testAddIndexFileRejectsNull() {
+    SnapshotProducer<?> append = (SnapshotProducer<?>) table.newFastAppend().appendFile(FILE_A);
+    assertThatThrownBy(() -> append.addIndexFile(null))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Invalid index file path: null");
+  }
 }
