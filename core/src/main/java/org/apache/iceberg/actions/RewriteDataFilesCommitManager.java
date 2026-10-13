@@ -18,14 +18,21 @@
  */
 package org.apache.iceberg.actions;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.RewriteFiles;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.deletes.CompactionMap;
 import org.apache.iceberg.exceptions.CleanableFailure;
 import org.apache.iceberg.exceptions.CommitStateUnknownException;
+import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.util.DataFileSet;
 import org.apache.iceberg.util.DeleteFileSet;
 import org.apache.iceberg.util.Tasks;
@@ -41,6 +48,11 @@ public class RewriteDataFilesCommitManager {
   private final boolean useStartingSequenceNumber;
   private final Map<String, String> snapshotProperties;
   private final String branch;
+
+  private boolean resolveConflicts = false;
+  private int maxConflictingDeleteFiles = 0;
+  private int maxConflictRetries = 0;
+  private Runnable beforeCommitHook = null;
 
   // constructor used for testing
   public RewriteDataFilesCommitManager(Table table) {
@@ -78,6 +90,45 @@ public class RewriteDataFilesCommitManager {
   }
 
   /**
+   * Enables rebasing of position deletes committed concurrently with the rewrite.
+   *
+   * <p>When enabled, and when the rewritten groups carry {@link RewriteFileGroup#positionRuns()
+   * position runs}, the commit does not fail on deletion vectors added to the rewritten files after
+   * the starting snapshot. Instead, those deletion vectors are remapped onto the new files through
+   * the recorded runs and committed together with the rewrite.
+   *
+   * <p>Requires {@code useStartingSequenceNumber}: rebasing moves the validation baseline forward
+   * while output files must keep the starting data sequence number so that concurrent equality
+   * deletes still apply to them.
+   *
+   * @param maxDeleteFiles maximum number of concurrently added delete files to rebase per commit
+   * @param maxRetries maximum number of commit attempts when new deletes keep arriving
+   * @return this for method chaining
+   */
+  public RewriteDataFilesCommitManager resolvePositionDeleteConflicts(
+      int maxDeleteFiles, int maxRetries) {
+    Preconditions.checkArgument(
+        useStartingSequenceNumber,
+        "Cannot resolve position delete conflicts without using the starting sequence number");
+    Preconditions.checkArgument(maxDeleteFiles > 0, "maxDeleteFiles must be positive");
+    Preconditions.checkArgument(maxRetries > 0, "maxRetries must be positive");
+    this.resolveConflicts = true;
+    this.maxConflictingDeleteFiles = maxDeleteFiles;
+    this.maxConflictRetries = maxRetries;
+    return this;
+  }
+
+  /**
+   * Hook invoked inside each commit attempt, after conflict detection and right before the commit,
+   * when conflict resolution is enabled. Exists so tests can inject a concurrent commit between
+   * detection and commit, or fail an attempt by throwing a {@link ValidationException}.
+   */
+  @VisibleForTesting
+  public void beforeCommitAttempt(Runnable hook) {
+    this.beforeCommitHook = hook;
+  }
+
+  /**
    * Perform a commit operation on the table adding and removing files as required for this set of
    * file groups
    *
@@ -87,21 +138,119 @@ public class RewriteDataFilesCommitManager {
     DataFileSet rewrittenDataFiles = DataFileSet.create();
     DataFileSet addedDataFiles = DataFileSet.create();
     DeleteFileSet danglingDVs = DeleteFileSet.create();
+    List<CompactionMap.Run> runs = Lists.newArrayList();
+    boolean allGroupsTracked = true;
     for (RewriteFileGroup group : fileGroups) {
       rewrittenDataFiles.addAll(group.rewrittenFiles());
       addedDataFiles.addAll(group.addedFiles());
       danglingDVs.addAll(group.danglingDVs());
+      if (group.positionRuns() != null) {
+        runs.addAll(group.positionRuns());
+      } else {
+        allGroupsTracked = false;
+      }
     }
 
-    RewriteFiles rewrite = table.newRewrite().validateFromSnapshot(startingSnapshotId);
-    if (useStartingSequenceNumber) {
-      long sequenceNumber = table.snapshot(startingSnapshotId).sequenceNumber();
-      rewrite.dataSequenceNumber(sequenceNumber);
+    if (resolveConflicts && allGroupsTracked) {
+      commitWithConflictResolution(
+          rewrittenDataFiles, addedDataFiles, danglingDVs, CompactionMap.of(runs));
+      return;
     }
 
+    if (resolveConflicts) {
+      LOG.warn(
+          "Position delete conflict resolution is enabled but not all groups tracked positions;"
+              + " committing without rebasing");
+    }
+
+    RewriteFiles rewrite = newRewrite(startingSnapshotId);
     rewrittenDataFiles.forEach(rewrite::deleteFile);
     addedDataFiles.forEach(rewrite::addFile);
     danglingDVs.forEach(rewrite::deleteFile);
+    rewrite.commit();
+  }
+
+  /**
+   * Commits the rewrite, rebasing deletion vectors added since the starting snapshot.
+   *
+   * <p>Each attempt resolves the window {@code (baseline, current]}, advances the validation
+   * baseline to {@code current} and commits. If another writer lands a delete between detection and
+   * commit, the commit fails validation and the next attempt resolves the new window.
+   */
+  private void commitWithConflictResolution(
+      DataFileSet rewrittenDataFiles,
+      DataFileSet addedDataFiles,
+      DeleteFileSet plannedDanglingDVs,
+      CompactionMap map) {
+    PositionDeleteConflictResolver resolver =
+        new PositionDeleteConflictResolver(table, map, rewrittenDataFiles, addedDataFiles);
+
+    long baseline = startingSnapshotId;
+    DeleteFileSet deletesToRemove = DeleteFileSet.of(plannedDanglingDVs);
+    List<DeleteFile> deletesToAdd = Lists.newArrayList();
+
+    ValidationException lastFailure = null;
+    for (int attempt = 1; attempt <= maxConflictRetries; attempt++) {
+      table.refresh();
+      Snapshot current = branch != null ? table.snapshot(branch) : table.currentSnapshot();
+      Preconditions.checkState(current != null, "Cannot commit rewrite: no current snapshot");
+
+      if (current.snapshotId() == baseline && lastFailure != null) {
+        // nothing new to rebase, so retrying would fail the same way
+        throw lastFailure;
+      }
+
+      if (current.snapshotId() != baseline) {
+        PositionDeleteConflictResolver.Resolution resolution =
+            resolver.resolve(baseline, current, deletesToRemove, maxConflictingDeleteFiles);
+        // the resolver recomputes the planned set against the new window, so replace, not merge
+        deletesToRemove = DeleteFileSet.of(resolution.deletesToRemove());
+        deletesToAdd.addAll(resolution.deletesToAdd());
+        baseline = current.snapshotId();
+
+        if (resolution.conflictingDeleteFiles() > 0) {
+          LOG.info(
+              "Attempt {}: rebased {} concurrent delete files, validating from snapshot {}",
+              attempt,
+              resolution.conflictingDeleteFiles(),
+              baseline);
+        }
+      }
+
+      RewriteFiles rewrite = newRewrite(baseline);
+      rewrittenDataFiles.forEach(rewrite::deleteFile);
+      addedDataFiles.forEach(rewrite::addFile);
+      deletesToRemove.forEach(rewrite::deleteFile);
+      deletesToAdd.forEach(rewrite::addFile);
+
+      try {
+        if (beforeCommitHook != null) {
+          // part of the attempt: a ValidationException from the hook counts as a failed commit
+          beforeCommitHook.run();
+        }
+
+        rewrite.commit();
+        return;
+      } catch (ValidationException e) {
+        LOG.warn("Attempt {} to commit rewrite failed validation, retrying", attempt, e);
+        lastFailure = e;
+      }
+    }
+
+    throw new ValidationException(
+        lastFailure,
+        "Cannot commit rewrite after %s attempts to rebase concurrent deletes",
+        maxConflictRetries);
+  }
+
+  private RewriteFiles newRewrite(long validateFromSnapshotId) {
+    RewriteFiles rewrite = table.newRewrite().validateFromSnapshot(validateFromSnapshotId);
+    if (useStartingSequenceNumber) {
+      // output files always keep the sequence number of the snapshot they were derived from,
+      // even when validation starts from a later snapshot
+      long sequenceNumber = table.snapshot(startingSnapshotId).sequenceNumber();
+      rewrite.dataSequenceNumber(sequenceNumber);
+    }
 
     snapshotProperties.forEach(rewrite::set);
 
@@ -109,7 +258,7 @@ public class RewriteDataFilesCommitManager {
       rewrite.toBranch(branch);
     }
 
-    rewrite.commit();
+    return rewrite;
   }
 
   /**

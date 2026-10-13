@@ -134,4 +134,22 @@ public class SparkSQLProperties {
   // This determines how many rows are buffered before inferring shredded schema
   public static final String VARIANT_INFERENCE_BUFFER_SIZE =
       "spark.sql.iceberg.variant-inference-buffer-size";
+
+  // Controls whether bin-pack rewrites track row positions and rebase deletion vectors that were
+  // committed against the rewritten files while the rewrite was running, instead of failing the
+  // rewrite commit. Only applies to v3 tables (deletion vectors) and order-preserving rewrites.
+  public static final String COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_ENABLED =
+      "spark.sql.iceberg.compaction.resolve-position-delete-conflicts.enabled";
+  public static final boolean COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_ENABLED_DEFAULT = false;
+
+  // Maximum number of concurrently committed delete files a single rewrite commit will rebase
+  public static final String COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_MAX_DELETE_FILES =
+      "spark.sql.iceberg.compaction.resolve-position-delete-conflicts.max-delete-files";
+  public static final int COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_MAX_DELETE_FILES_DEFAULT =
+      100;
+
+  // Maximum number of commit attempts while new deletes keep arriving
+  public static final String COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_MAX_RETRIES =
+      "spark.sql.iceberg.compaction.resolve-position-delete-conflicts.max-retries";
+  public static final int COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_MAX_RETRIES_DEFAULT = 3;
 }

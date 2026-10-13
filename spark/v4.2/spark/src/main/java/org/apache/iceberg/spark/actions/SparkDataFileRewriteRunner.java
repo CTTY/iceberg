@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.actions;
 
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import org.apache.iceberg.DataFile;
@@ -25,6 +26,8 @@ import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.actions.RewriteDataFiles.FileGroupInfo;
 import org.apache.iceberg.actions.RewriteFileGroup;
+import org.apache.iceberg.deletes.CompactionMap;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.spark.FileRewriteCoordinator;
 import org.apache.iceberg.spark.ScanTaskSetManager;
 import org.apache.iceberg.spark.SparkTableCache;
@@ -42,6 +45,11 @@ abstract class SparkDataFileRewriteRunner
 
   abstract void doRewrite(String groupId, RewriteFileGroup fileGroup);
 
+  /** Whether this runner records source-to-target row positions while rewriting. */
+  boolean tracksPositions() {
+    return false;
+  }
+
   @Override
   public Set<DataFile> rewrite(RewriteFileGroup group) {
     String groupId = UUID.randomUUID().toString();
@@ -50,6 +58,13 @@ abstract class SparkDataFileRewriteRunner
       taskSetManager.stageTasks(table(), groupId, group.fileScanTasks());
 
       doRewrite(groupId, group);
+
+      if (tracksPositions()) {
+        List<CompactionMap.Run> runs = coordinator.fetchPositionRuns(table(), groupId);
+        Preconditions.checkState(
+            runs != null, "Rewrite of group %s tracked positions but staged no runs", groupId);
+        group.setPositionRuns(runs);
+      }
 
       return coordinator.fetchNewFiles(table(), groupId);
     } finally {

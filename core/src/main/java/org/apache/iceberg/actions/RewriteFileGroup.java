@@ -27,8 +27,10 @@ import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.RewriteJobOrder;
 import org.apache.iceberg.actions.RewriteDataFiles.FileGroupInfo;
+import org.apache.iceberg.deletes.CompactionMap;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.util.ContentFileUtil;
 import org.apache.iceberg.util.DataFileSet;
 import org.apache.iceberg.util.DeleteFileSet;
@@ -40,6 +42,7 @@ import org.apache.iceberg.util.DeleteFileSet;
 public class RewriteFileGroup extends RewriteGroupBase<FileGroupInfo, FileScanTask, DataFile> {
   private final int outputSpecId;
   private DataFileSet addedFiles = DataFileSet.create();
+  private List<CompactionMap.Run> positionRuns = null;
 
   public RewriteFileGroup(
       FileGroupInfo info,
@@ -70,6 +73,21 @@ public class RewriteFileGroup extends RewriteGroupBase<FileGroupInfo, FileScanTa
 
   public Set<DataFile> addedFiles() {
     return addedFiles;
+  }
+
+  /**
+   * Records how row positions moved from the rewritten files to the added files.
+   *
+   * <p>Only set when the rewrite tracked positions (order-preserving rewrites with position
+   * tracking enabled). Used to rebase position deletes committed concurrently with the rewrite.
+   */
+  public void setPositionRuns(List<CompactionMap.Run> runs) {
+    this.positionRuns = runs == null ? null : ImmutableList.copyOf(runs);
+  }
+
+  /** Returns the position runs recorded by the rewrite, or null if positions were not tracked. */
+  public List<CompactionMap.Run> positionRuns() {
+    return positionRuns;
   }
 
   public RewriteDataFiles.FileGroupRewriteResult asResult() {

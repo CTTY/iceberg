@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.source;
 
+import java.util.List;
 import java.util.Set;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.PositionDeletesTable;
@@ -25,6 +26,9 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.spark.FileRewriteCoordinator;
+import org.apache.iceberg.types.Types;
 import org.apache.spark.sql.connector.catalog.SupportsRead;
 import org.apache.spark.sql.connector.catalog.SupportsWrite;
 import org.apache.spark.sql.connector.catalog.TableCapability;
@@ -39,10 +43,16 @@ public class SparkRewriteTable extends BaseSparkTable implements SupportsRead, S
       ImmutableSet.of(TableCapability.BATCH_READ, TableCapability.BATCH_WRITE);
 
   private final String groupId;
+  private final Schema rewriteSchema;
 
   public SparkRewriteTable(Table table, String groupId) {
-    super(table, rewriteSchema(table));
+    this(table, groupId, rewriteSchema(table, groupId));
+  }
+
+  private SparkRewriteTable(Table table, String groupId, Schema rewriteSchema) {
+    super(table, rewriteSchema);
     this.groupId = groupId;
+    this.rewriteSchema = rewriteSchema;
   }
 
   @Override
@@ -60,15 +70,29 @@ public class SparkRewriteTable extends BaseSparkTable implements SupportsRead, S
     if (table() instanceof PositionDeletesTable) {
       return new SparkPositionDeletesRewriteBuilder(spark(), table(), groupId, info);
     } else {
-      return new SparkRewriteWriteBuilder(spark(), table(), rewriteSchema(table()), groupId, info);
+      return new SparkRewriteWriteBuilder(spark(), table(), rewriteSchema, groupId, info);
     }
   }
 
-  private static Schema rewriteSchema(Table table) {
-    if (TableUtil.supportsRowLineage(table)) {
-      return MetadataColumns.schemaWithRowLineage(table.schema());
-    } else {
-      return table.schema();
+  private static Schema rewriteSchema(Table table, String groupId) {
+    Schema schema =
+        TableUtil.supportsRowLineage(table)
+            ? MetadataColumns.schemaWithRowLineage(table.schema())
+            : table.schema();
+
+    if (FileRewriteCoordinator.get().tracksPositions(table, groupId)) {
+      // expose the source file and row position as columns so they flow through the write; the
+      // write builder strips them from the data schema before anything reaches the file writers
+      return schemaWithPositionTracking(schema);
     }
+
+    return schema;
+  }
+
+  static Schema schemaWithPositionTracking(Schema schema) {
+    List<Types.NestedField> columns = Lists.newArrayList(schema.columns());
+    columns.add(MetadataColumns.FILE_PATH);
+    columns.add(MetadataColumns.ROW_POSITION);
+    return new Schema(columns, schema.identifierFieldIds());
   }
 }

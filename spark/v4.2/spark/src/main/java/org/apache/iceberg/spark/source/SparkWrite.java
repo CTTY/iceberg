@@ -22,7 +22,9 @@ import static org.apache.iceberg.IsolationLevel.SERIALIZABLE;
 import static org.apache.iceberg.IsolationLevel.SNAPSHOT;
 
 import java.io.IOException;
+import java.io.Serializable;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.function.Function;
@@ -42,6 +44,7 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotSummary;
 import org.apache.iceberg.SnapshotUpdate;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.deletes.CompactionMap;
 import org.apache.iceberg.exceptions.CleanableFailure;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
@@ -116,9 +119,32 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
   private final boolean useMergeAppendForStreaming;
   private final SparkWriteRequirements writeRequirements;
   private final Map<String, String> writeProperties;
+  private final PositionTracking positionTracking;
 
   private boolean cleanupOnAbort = false;
   private InMemoryMetricsReporter metricsReporter;
+
+  /**
+   * Ordinals of the {@code _file} and {@code _pos} columns in the incoming rows of a rewrite that
+   * tracks row positions. Null when positions are not tracked.
+   */
+  static class PositionTracking implements Serializable {
+    private final int fileOrdinal;
+    private final int posOrdinal;
+
+    PositionTracking(int fileOrdinal, int posOrdinal) {
+      this.fileOrdinal = fileOrdinal;
+      this.posOrdinal = posOrdinal;
+    }
+
+    int fileOrdinal() {
+      return fileOrdinal;
+    }
+
+    int posOrdinal() {
+      return posOrdinal;
+    }
+  }
 
   SparkWrite(
       SparkSession spark,
@@ -130,6 +156,31 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
       Schema writeSchema,
       StructType dsSchema,
       SparkWriteRequirements writeRequirements) {
+    this(
+        spark,
+        table,
+        branch,
+        writeConf,
+        writeInfo,
+        applicationId,
+        writeSchema,
+        dsSchema,
+        writeRequirements,
+        null);
+  }
+
+  SparkWrite(
+      SparkSession spark,
+      Table table,
+      String branch,
+      SparkWriteConf writeConf,
+      LogicalWriteInfo writeInfo,
+      String applicationId,
+      Schema writeSchema,
+      StructType dsSchema,
+      SparkWriteRequirements writeRequirements,
+      PositionTracking positionTracking) {
+    this.positionTracking = positionTracking;
     this.sparkContext = JavaSparkContext.fromSparkContext(spark.sparkContext());
     this.table = table;
     this.writeConf = writeConf;
@@ -230,7 +281,8 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
         dsSchema,
         useFanoutWriter,
         writeProperties,
-        sortOrderId);
+        sortOrderId,
+        positionTracking);
   }
 
   private void commitOperation(SnapshotUpdate<?> operation, String description) {
@@ -573,6 +625,24 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
     public void commit(WriterCommitMessage[] messages) {
       FileRewriteCoordinator coordinator = FileRewriteCoordinator.get();
       coordinator.stageRewrite(table, fileSetID, files(messages));
+      if (positionTracking != null) {
+        coordinator.stagePositionRuns(table, fileSetID, positionRuns(messages));
+      }
+    }
+
+    private List<CompactionMap.Run> positionRuns(WriterCommitMessage[] messages) {
+      List<CompactionMap.Run> runs = Lists.newArrayList();
+      for (WriterCommitMessage message : messages) {
+        if (message != null) {
+          TaskCommit taskCommit = (TaskCommit) message;
+          Preconditions.checkState(
+              taskCommit.positionRuns() != null,
+              "Rewrite tracks positions but a task reported no position runs");
+          runs.addAll(taskCommit.positionRuns());
+        }
+      }
+
+      return runs;
     }
   }
 
@@ -688,9 +758,20 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
 
   public static class TaskCommit implements WriterCommitMessage {
     private final DataFile[] taskFiles;
+    // runs describing where the rows of each task file came from; null unless positions tracked
+    private final List<CompactionMap.Run> positionRuns;
 
     TaskCommit(DataFile[] taskFiles) {
+      this(taskFiles, null);
+    }
+
+    TaskCommit(DataFile[] taskFiles, List<CompactionMap.Run> positionRuns) {
       this.taskFiles = taskFiles;
+      this.positionRuns = positionRuns;
+    }
+
+    List<CompactionMap.Run> positionRuns() {
+      return positionRuns;
     }
 
     // Reports bytesWritten and recordsWritten to the Spark output metrics.
@@ -727,6 +808,7 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
     private final String queryId;
     private final Map<String, String> writeProperties;
     private final int sortOrderId;
+    private final PositionTracking positionTracking;
 
     protected WriterFactory(
         Broadcast<Table> tableBroadcast,
@@ -738,7 +820,9 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
         StructType dsSchema,
         boolean useFanoutWriter,
         Map<String, String> writeProperties,
-        int sortOrderId) {
+        int sortOrderId,
+        PositionTracking positionTracking) {
+      this.positionTracking = positionTracking;
       this.tableBroadcast = tableBroadcast;
       this.format = format;
       this.outputSpecId = outputSpecId;
@@ -778,22 +862,37 @@ abstract class SparkWrite extends BaseSparkWrite implements Write, RequiresDistr
 
       Function<InternalRow, InternalRow> rowLineageExtractor = new ExtractRowLineage(writeSchema);
 
+      DataWriter<InternalRow> writer;
       if (spec.isUnpartitioned()) {
-        return new UnpartitionedDataWriter(
-            writerFactory, fileFactory, io, spec, targetFileSize, rowLineageExtractor);
+        writer =
+            new UnpartitionedDataWriter(
+                writerFactory, fileFactory, io, spec, targetFileSize, rowLineageExtractor);
 
       } else {
-        return new PartitionedDataWriter(
-            writerFactory,
-            fileFactory,
-            io,
+        writer =
+            new PartitionedDataWriter(
+                writerFactory,
+                fileFactory,
+                io,
+                spec,
+                writeSchema,
+                dsSchema,
+                targetFileSize,
+                useFanoutWriter,
+                rowLineageExtractor);
+      }
+
+      if (positionTracking != null) {
+        return new PositionTrackingDataWriter(
+            writer,
             spec,
             writeSchema,
             dsSchema,
-            targetFileSize,
-            useFanoutWriter,
-            rowLineageExtractor);
+            positionTracking.fileOrdinal(),
+            positionTracking.posOrdinal());
       }
+
+      return writer;
     }
   }
 

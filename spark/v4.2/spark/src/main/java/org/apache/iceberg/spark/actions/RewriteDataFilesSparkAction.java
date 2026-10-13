@@ -35,6 +35,7 @@ import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableUtil;
 import org.apache.iceberg.actions.BinPackRewriteFilePlanner;
 import org.apache.iceberg.actions.FileRewritePlan;
 import org.apache.iceberg.actions.FileRewriteRunner;
@@ -109,6 +110,9 @@ public class RewriteDataFilesSparkAction
   private boolean partialProgressEnabled;
   private boolean removeDanglingDeletes;
   private boolean useStartingSequenceNumber;
+  private boolean resolvePositionDeleteConflicts;
+  private int resolveConflictsMaxDeleteFiles;
+  private int resolveConflictsMaxRetries;
   private boolean caseSensitive;
   private String branch = SnapshotRef.MAIN_BRANCH;
   private BinPackRewriteFilePlanner planner = null;
@@ -259,8 +263,16 @@ public class RewriteDataFilesSparkAction
 
   @VisibleForTesting
   RewriteDataFilesCommitManager commitManager(long startingSnapshotId) {
-    return new RewriteDataFilesCommitManager(
-        table, startingSnapshotId, useStartingSequenceNumber, commitSummary(), branch);
+    RewriteDataFilesCommitManager commitManager =
+        new RewriteDataFilesCommitManager(
+            table, startingSnapshotId, useStartingSequenceNumber, commitSummary(), branch);
+
+    if (resolvePositionDeleteConflicts) {
+      commitManager.resolvePositionDeleteConflicts(
+          resolveConflictsMaxDeleteFiles, resolveConflictsMaxRetries);
+    }
+
+    return commitManager;
   }
 
   private Builder doExecute(
@@ -434,6 +446,8 @@ public class RewriteDataFilesSparkAction
         PropertyUtil.propertyAsBoolean(
             options(), REMOVE_DANGLING_DELETES, REMOVE_DANGLING_DELETES_DEFAULT);
 
+    initPositionDeleteConflictResolution();
+
     boolean cacheDeleteFiles =
         PropertyUtil.propertyAsBoolean(options(), CACHE_DELETE_FILES, CACHE_DELETE_FILES_DEFAULT);
     spark()
@@ -454,6 +468,74 @@ public class RewriteDataFilesSparkAction
         PARTIAL_PROGRESS_MAX_COMMITS,
         maxCommits,
         PARTIAL_PROGRESS_ENABLED);
+  }
+
+  /**
+   * Reads the session configuration that turns on rebasing of concurrently committed deletion
+   * vectors. The feature is only wired for bin-pack rewrites, the one order-preserving runner that
+   * can record row positions; other runners silently keep the default behavior.
+   */
+  private void initPositionDeleteConflictResolution() {
+    boolean enabled =
+        Boolean.parseBoolean(
+            spark()
+                .conf()
+                .get(
+                    SparkSQLProperties.COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_ENABLED,
+                    String.valueOf(
+                        SparkSQLProperties
+                            .COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_ENABLED_DEFAULT)));
+
+    if (!enabled) {
+      this.resolvePositionDeleteConflicts = false;
+      return;
+    }
+
+    if (!(runner instanceof SparkBinPackFileRewriteRunner)) {
+      LOG.warn(
+          "{} is enabled but rewrite mode {} does not track positions; concurrent deletes will"
+              + " fail the commit as usual",
+          SparkSQLProperties.COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_ENABLED,
+          runner.description());
+      this.resolvePositionDeleteConflicts = false;
+      return;
+    }
+
+    Preconditions.checkArgument(
+        useStartingSequenceNumber,
+        "Cannot enable %s when %s is false: rebased deletes require output files to keep the"
+            + " starting sequence number",
+        SparkSQLProperties.COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_ENABLED,
+        USE_STARTING_SEQUENCE_NUMBER);
+
+    Preconditions.checkArgument(
+        TableUtil.formatVersion(table) >= 3,
+        "Cannot enable %s for a v%s table: only deletion vectors (v3+) can be rebased",
+        SparkSQLProperties.COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_ENABLED,
+        TableUtil.formatVersion(table));
+
+    this.resolvePositionDeleteConflicts = true;
+    this.resolveConflictsMaxDeleteFiles =
+        Integer.parseInt(
+            spark()
+                .conf()
+                .get(
+                    SparkSQLProperties
+                        .COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_MAX_DELETE_FILES,
+                    String.valueOf(
+                        SparkSQLProperties
+                            .COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_MAX_DELETE_FILES_DEFAULT)));
+    this.resolveConflictsMaxRetries =
+        Integer.parseInt(
+            spark()
+                .conf()
+                .get(
+                    SparkSQLProperties.COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_MAX_RETRIES,
+                    String.valueOf(
+                        SparkSQLProperties
+                            .COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_MAX_RETRIES_DEFAULT)));
+
+    ((SparkBinPackFileRewriteRunner) runner).trackPositions(true);
   }
 
   private String jobDesc(

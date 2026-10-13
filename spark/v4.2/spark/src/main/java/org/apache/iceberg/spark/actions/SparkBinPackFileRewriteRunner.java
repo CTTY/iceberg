@@ -21,6 +21,7 @@ package org.apache.iceberg.spark.actions;
 import org.apache.iceberg.DistributionMode;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.actions.RewriteFileGroup;
+import org.apache.iceberg.spark.FileRewriteCoordinator;
 import org.apache.iceberg.spark.SparkReadOptions;
 import org.apache.iceberg.spark.SparkWriteOptions;
 import org.apache.spark.sql.Dataset;
@@ -28,6 +29,8 @@ import org.apache.spark.sql.Row;
 import org.apache.spark.sql.SparkSession;
 
 class SparkBinPackFileRewriteRunner extends SparkDataFileRewriteRunner {
+
+  private boolean trackPositions = false;
 
   SparkBinPackFileRewriteRunner(SparkSession spark, Table table) {
     super(spark, table);
@@ -38,9 +41,30 @@ class SparkBinPackFileRewriteRunner extends SparkDataFileRewriteRunner {
     return "BIN-PACK";
   }
 
+  /**
+   * Enables recording of source-to-target row positions while rewriting. The resulting runs are
+   * attached to the {@link RewriteFileGroup} and allow the commit to rebase deletion vectors that
+   * were committed concurrently against the rewritten files.
+   */
+  SparkBinPackFileRewriteRunner trackPositions(boolean enabled) {
+    this.trackPositions = enabled;
+    return this;
+  }
+
+  @Override
+  boolean tracksPositions() {
+    return trackPositions;
+  }
+
   @Override
   protected void doRewrite(String groupId, RewriteFileGroup group) {
-    // read the files packing them into splits of the required size
+    if (trackPositions) {
+      // must precede the load: the rewrite table decides its schema from this flag
+      FileRewriteCoordinator.get().enablePositionTracking(table(), groupId);
+    }
+
+    // read the files packing them into splits of the required size; with position tracking the
+    // rewrite table also exposes _file and _pos, which the tracking writer consumes
     Dataset<Row> scanDF =
         spark()
             .read()
