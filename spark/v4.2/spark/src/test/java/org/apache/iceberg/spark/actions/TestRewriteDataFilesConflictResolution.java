@@ -520,23 +520,60 @@ public class TestRewriteDataFilesConflictResolution extends TestBase {
         .hasMessageContaining("only deletion vectors (v3+) can be rebased");
   }
 
+  /**
+   * Without the starting sequence number, output files get a new sequence number. A concurrent DV
+   * still applies ({@code data_seq <= dv_seq}) so rebasing works exactly as before.
+   */
   @Test
-  public void testActionRejectsNewSequenceNumberWhenEnabled() {
+  public void testNewSequenceNumberRebasesDeletionVectors() throws IOException {
     Table table = createTable(3);
-    writeRecords(table, 2, 100);
+    writeRecords(table, 2, 200);
+    long startingSnapshotId = table.currentSnapshot().snapshotId();
+    long startingSeq = table.currentSnapshot().sequenceNumber();
+    DataFile d0 = dataFiles(table).get(0);
+    Map<String, Map<Long, String>> keysBySourcePosition = keysByFileAndPosition(table);
 
-    spark
-        .conf()
-        .set(SparkSQLProperties.COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_ENABLED, "true");
+    Set<RewriteFileGroup> groups = prepareRewrite(table, startingSnapshotId);
+    List<Long> deleted = Lists.newArrayList(1L, 2L, 3L);
+    commitDV(table, d0, deleted);
+
+    commitManager(table, startingSnapshotId, true, false /* useStartingSequenceNumber */)
+        .commitFileGroups(groups);
+
+    Set<String> expectedKeys = allKeys(keysBySourcePosition);
+    deleted.forEach(pos -> expectedKeys.remove(keysBySourcePosition.get(d0.location()).get(pos)));
+    assertThat(currentKeys(table)).isEqualTo(expectedKeys);
+    // output files really did receive a new sequence number
+    assertThat(dataFiles(table))
+        .allSatisfy(file -> assertThat(file.dataSequenceNumber()).isGreaterThan(startingSeq));
+  }
+
+  /**
+   * Without the starting sequence number a concurrent equality delete would stop applying to the
+   * output ({@code data_seq < eq_seq} fails), so it must be reported instead of being ignored. This
+   * matches upstream behavior for {@code use-starting-sequence-number=false}.
+   */
+  @Test
+  public void testNewSequenceNumberRejectsConcurrentEqualityDelete() throws IOException {
+    Table table = createTable(3);
+    writeRecords(table, 2, 200);
+    long startingSnapshotId = table.currentSnapshot().snapshotId();
+    String deletedKey = currentKeys(table).iterator().next();
+
+    Set<RewriteFileGroup> groups = prepareRewrite(table, startingSnapshotId);
+    commitEqualityDelete(table, "c2", deletedKey);
+
     assertThatThrownBy(
             () ->
-                SparkActions.get(spark)
-                    .rewriteDataFiles(table)
-                    .option(SizeBasedFileRewritePlanner.MIN_INPUT_FILES, "1")
-                    .option(RewriteDataFiles.USE_STARTING_SEQUENCE_NUMBER, "false")
-                    .execute())
-        .isInstanceOf(IllegalArgumentException.class)
-        .hasMessageContaining("starting sequence number");
+                commitManager(
+                        table, startingSnapshotId, true, false /* useStartingSequenceNumber */)
+                    .commitFileGroups(groups))
+        .isInstanceOf(ValidationException.class)
+        .hasMessageContaining("added equality delete");
+
+    // nothing was committed; the equality delete is still the latest snapshot and still applies
+    assertThat(table.currentSnapshot().operation()).isEqualTo("delete");
+    assertThat(currentKeys(table)).doesNotContain(deletedKey);
   }
 
   // ---- helpers ----
@@ -625,8 +662,16 @@ public class TestRewriteDataFilesConflictResolution extends TestBase {
 
   private RewriteDataFilesCommitManager commitManager(
       Table table, long startingSnapshotId, boolean resolveConflicts) {
+    return commitManager(table, startingSnapshotId, resolveConflicts, true);
+  }
+
+  private RewriteDataFilesCommitManager commitManager(
+      Table table,
+      long startingSnapshotId,
+      boolean resolveConflicts,
+      boolean useStartingSequenceNumber) {
     RewriteDataFilesCommitManager commitManager =
-        new RewriteDataFilesCommitManager(table, startingSnapshotId, true);
+        new RewriteDataFilesCommitManager(table, startingSnapshotId, useStartingSequenceNumber);
     if (resolveConflicts) {
       commitManager.resolvePositionDeleteConflicts(MAX_DELETE_FILES, MAX_RETRIES);
     }

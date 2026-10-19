@@ -97,9 +97,11 @@ public class RewriteDataFilesCommitManager {
    * the starting snapshot. Instead, those deletion vectors are remapped onto the new files through
    * the recorded runs and committed together with the rewrite.
    *
-   * <p>Requires {@code useStartingSequenceNumber}: rebasing moves the validation baseline forward
-   * while output files must keep the starting data sequence number so that concurrent equality
-   * deletes still apply to them.
+   * <p>Rebasing moves the validation baseline forward, which skips the usual check for concurrent
+   * equality deletes. With {@code useStartingSequenceNumber} the output files keep the starting
+   * data sequence number and those deletes still apply, so they are ignored. Without it, a
+   * concurrent equality delete is reported as a conflict, matching the existing behavior of {@code
+   * RewriteFiles} in that mode.
    *
    * @param maxDeleteFiles maximum number of concurrently added delete files to rebase per commit
    * @param maxRetries maximum number of commit attempts when new deletes keep arriving
@@ -107,9 +109,6 @@ public class RewriteDataFilesCommitManager {
    */
   public RewriteDataFilesCommitManager resolvePositionDeleteConflicts(
       int maxDeleteFiles, int maxRetries) {
-    Preconditions.checkArgument(
-        useStartingSequenceNumber,
-        "Cannot resolve position delete conflicts without using the starting sequence number");
     Preconditions.checkArgument(maxDeleteFiles > 0, "maxDeleteFiles must be positive");
     Preconditions.checkArgument(maxRetries > 0, "maxRetries must be positive");
     this.resolveConflicts = true;
@@ -183,7 +182,8 @@ public class RewriteDataFilesCommitManager {
       DeleteFileSet plannedDanglingDVs,
       CompactionMap map) {
     PositionDeleteConflictResolver resolver =
-        new PositionDeleteConflictResolver(table, map, rewrittenDataFiles, addedDataFiles);
+        new PositionDeleteConflictResolver(
+            table, map, rewrittenDataFiles, addedDataFiles, useStartingSequenceNumber);
 
     long baseline = startingSnapshotId;
     DeleteFileSet deletesToRemove = DeleteFileSet.of(plannedDanglingDVs);

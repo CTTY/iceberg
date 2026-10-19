@@ -501,12 +501,14 @@ public class RewriteDataFilesSparkAction
       return;
     }
 
-    Preconditions.checkArgument(
-        useStartingSequenceNumber,
-        "Cannot enable %s when %s is false: rebased deletes require output files to keep the"
-            + " starting sequence number",
-        SparkSQLProperties.COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_ENABLED,
-        USE_STARTING_SEQUENCE_NUMBER);
+    if (!useStartingSequenceNumber) {
+      LOG.warn(
+          "{} is enabled with {}=false: concurrent deletion vectors will be rebased, but a"
+              + " concurrent equality delete will fail the commit because it would not apply to"
+              + " output files that receive a new sequence number",
+          SparkSQLProperties.COMPACTION_RESOLVE_POSITION_DELETE_CONFLICTS_ENABLED,
+          USE_STARTING_SEQUENCE_NUMBER);
+    }
 
     Preconditions.checkArgument(
         TableUtil.formatVersion(table) >= 3,

@@ -58,9 +58,10 @@ import org.slf4j.LoggerFactory;
  * the compaction map and writes new deletion vectors against the rewrite's output files. The caller
  * then removes the original DVs and adds the remapped ones in the same {@code REPLACE} commit.
  *
- * <p>Only v3 deletion vectors are handled. Equality deletes commute with order-preserving rewrites
- * by construction (they match by value, and the rewrite keeps the starting data sequence number)
- * and are ignored. v2 position delete files are reported as unresolvable conflicts.
+ * <p>Only v3 deletion vectors are rebased. Equality deletes match by value and need no remapping;
+ * they are ignored when the rewrite keeps the starting data sequence number (so they still apply to
+ * the output) and reported as conflicts otherwise. v2 position delete files are reported as
+ * unresolvable conflicts.
  */
 public class PositionDeleteConflictResolver {
   private static final Logger LOG = LoggerFactory.getLogger(PositionDeleteConflictResolver.class);
@@ -100,11 +101,30 @@ public class PositionDeleteConflictResolver {
   private final CompactionMap map;
   private final Map<String, DataFile> targetFilesByLocation;
   private final Set<String> sourceLocations;
+  private final boolean outputKeepsStartingSequenceNumber;
 
+  /**
+   * @param table the table being rewritten
+   * @param map position runs recorded by the rewrite
+   * @param sourceFiles data files being replaced
+   * @param targetFiles data files produced by the rewrite
+   * @param outputKeepsStartingSequenceNumber whether the rewrite assigns the starting snapshot's
+   *     data sequence number to its output files. When true, equality deletes committed during the
+   *     rewrite keep applying to the output and are ignored. When false, the output receives a
+   *     newer sequence number, concurrent equality deletes would stop applying to it, and any
+   *     equality delete in the window is reported as an unresolvable conflict. This mirrors {@code
+   *     MergingSnapshotProducer.validateNoNewDeletesForDataFiles}, which ignores equality deletes
+   *     only when a data sequence number is set.
+   */
   public PositionDeleteConflictResolver(
-      Table table, CompactionMap map, Set<DataFile> sourceFiles, Set<DataFile> targetFiles) {
+      Table table,
+      CompactionMap map,
+      Set<DataFile> sourceFiles,
+      Set<DataFile> targetFiles,
+      boolean outputKeepsStartingSequenceNumber) {
     this.table = table;
     this.map = map;
+    this.outputKeepsStartingSequenceNumber = outputKeepsStartingSequenceNumber;
     this.sourceLocations = Sets.newHashSet();
     sourceFiles.forEach(file -> sourceLocations.add(file.location()));
     this.targetFilesByLocation = Maps.newHashMap();
@@ -185,8 +205,15 @@ public class PositionDeleteConflictResolver {
   private void classifyAddedDelete(
       Snapshot snapshot, DeleteFile added, Map<String, DeleteFile> addedDVs) {
     if (added.content() == FileContent.EQUALITY_DELETES) {
-      // applies by value; commutes with the rewrite because output files keep the starting
-      // data sequence number
+      // applies by value, so there is nothing to remap; it commutes with the rewrite only if the
+      // output files keep a sequence number below the delete's (data_seq < delete_seq)
+      ValidationException.check(
+          outputKeepsStartingSequenceNumber,
+          "Cannot rebase rewrite: snapshot %s added equality delete %s and the rewrite assigns a"
+              + " new data sequence number to its output, so the delete would no longer apply."
+              + " Use use-starting-sequence-number=true to allow concurrent equality deletes.",
+          snapshot.snapshotId(),
+          added.location());
       return;
     }
 
