@@ -146,9 +146,12 @@ public class PositionDeleteConflictResolver {
       Snapshot current,
       Set<DeleteFile> plannedDanglingDeletes,
       int maxDeleteFiles) {
-    Set<String> removedInWindow = Sets.newHashSet();
-    // insertion order matters for deterministic output
-    Map<String, DeleteFile> addedDVs = Maps.newLinkedHashMap();
+    // DVs are identified by (location, offset, length), never by location alone: one Puffin file
+    // commonly holds the DVs of several data files, so location is not unique. DeleteFileSet
+    // implements exactly that identity.
+    DeleteFileSet removedInWindow = DeleteFileSet.create();
+    // DeleteFileSet preserves insertion order, which keeps the output deterministic
+    DeleteFileSet addedDVs = DeleteFileSet.create();
 
     Iterable<Snapshot> window =
         SnapshotUtil.ancestorsBetween(current.snapshotId(), baselineSnapshotId, table::snapshot);
@@ -164,7 +167,7 @@ public class PositionDeleteConflictResolver {
       }
 
       for (DeleteFile removed : snapshot.removedDeleteFiles(table.io())) {
-        removedInWindow.add(removed.location());
+        removedInWindow.add(removed);
       }
 
       for (DeleteFile added : snapshot.addedDeleteFiles(table.io())) {
@@ -173,7 +176,7 @@ public class PositionDeleteConflictResolver {
     }
 
     // a DV added and then replaced within the window is not live anymore
-    addedDVs.keySet().removeIf(removedInWindow::contains);
+    addedDVs.removeAll(removedInWindow);
 
     ValidationException.check(
         addedDVs.size() <= maxDeleteFiles,
@@ -184,14 +187,14 @@ public class PositionDeleteConflictResolver {
     // planned dangling DVs that were replaced by a concurrent writer no longer exist
     Set<DeleteFile> toRemove = DeleteFileSet.create();
     for (DeleteFile planned : plannedDanglingDeletes) {
-      if (!removedInWindow.contains(planned.location())) {
+      if (!removedInWindow.contains(planned)) {
         toRemove.add(planned);
       }
     }
 
-    toRemove.addAll(addedDVs.values());
+    toRemove.addAll(addedDVs);
 
-    List<DeleteFile> toAdd = rebase(addedDVs.values());
+    List<DeleteFile> toAdd = rebase(addedDVs);
 
     LOG.info(
         "Rebased {} concurrently added DVs onto {} rewritten files, producing {} new DVs",
@@ -202,8 +205,7 @@ public class PositionDeleteConflictResolver {
     return new Resolution(toRemove, toAdd, addedDVs.size());
   }
 
-  private void classifyAddedDelete(
-      Snapshot snapshot, DeleteFile added, Map<String, DeleteFile> addedDVs) {
+  private void classifyAddedDelete(Snapshot snapshot, DeleteFile added, Set<DeleteFile> addedDVs) {
     if (added.content() == FileContent.EQUALITY_DELETES) {
       // applies by value, so there is nothing to remap; it commutes with the rewrite only if the
       // output files keep a sequence number below the delete's (data_seq < delete_seq)
@@ -220,7 +222,7 @@ public class PositionDeleteConflictResolver {
     String referenced = added.referencedDataFile();
     if (ContentFileUtil.isDV(added)) {
       if (sourceLocations.contains(referenced)) {
-        addedDVs.put(added.location(), added);
+        addedDVs.add(added);
       }
 
       return;
@@ -243,9 +245,22 @@ public class PositionDeleteConflictResolver {
     for (DeleteFile dv : dvs) {
       String sourceFile = dv.referencedDataFile();
       Preconditions.checkState(
-          map.containsSource(sourceFile),
-          "Rewrite replaced %s but recorded no position runs for it",
+          sourceLocations.contains(sourceFile),
+          "Cannot rebase DV %s: %s is not replaced by this rewrite",
+          dv.location(),
           sourceFile);
+
+      if (!map.containsSource(sourceFile)) {
+        // the rewrite read this source file but carried none of its rows into the output: every
+        // row was already deleted at the starting snapshot, so a concurrent delete on it is a
+        // no-op. The writer verifies that tracked rows match the output record counts, so a
+        // missing source here cannot be a tracking gap.
+        LOG.debug(
+            "DV {} references {} which has no surviving rows in the rewrite; dropping",
+            dv.location(),
+            sourceFile);
+        continue;
+      }
 
       PositionDeleteIndex positions = readDV(dv);
       Map<String, PositionDeleteIndex> remapped = map.remap(sourceFile, positions);

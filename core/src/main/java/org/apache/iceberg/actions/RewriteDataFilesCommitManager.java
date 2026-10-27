@@ -33,6 +33,7 @@ import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTest
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.util.DataFileSet;
 import org.apache.iceberg.util.DeleteFileSet;
 import org.apache.iceberg.util.Tasks;
@@ -187,60 +188,87 @@ public class RewriteDataFilesCommitManager {
 
     long baseline = startingSnapshotId;
     DeleteFileSet deletesToRemove = DeleteFileSet.of(plannedDanglingDVs);
+    // rebased DVs accumulate across attempts: a DV rebased in attempt N is still needed in N+1
     List<DeleteFile> deletesToAdd = Lists.newArrayList();
 
-    ValidationException lastFailure = null;
-    for (int attempt = 1; attempt <= maxConflictRetries; attempt++) {
-      table.refresh();
-      Snapshot current = branch != null ? table.snapshot(branch) : table.currentSnapshot();
-      Preconditions.checkState(current != null, "Cannot commit rewrite: no current snapshot");
+    try {
+      ValidationException lastFailure = null;
+      for (int attempt = 1; attempt <= maxConflictRetries; attempt++) {
+        table.refresh();
+        Snapshot current = branch != null ? table.snapshot(branch) : table.currentSnapshot();
+        Preconditions.checkState(current != null, "Cannot commit rewrite: no current snapshot");
 
-      if (current.snapshotId() == baseline && lastFailure != null) {
-        // nothing new to rebase, so retrying would fail the same way
-        throw lastFailure;
-      }
+        if (current.snapshotId() == baseline && lastFailure != null) {
+          // nothing new to rebase, so retrying would fail the same way
+          throw lastFailure;
+        }
 
-      if (current.snapshotId() != baseline) {
-        PositionDeleteConflictResolver.Resolution resolution =
-            resolver.resolve(baseline, current, deletesToRemove, maxConflictingDeleteFiles);
-        // the resolver recomputes the planned set against the new window, so replace, not merge
-        deletesToRemove = DeleteFileSet.of(resolution.deletesToRemove());
-        deletesToAdd.addAll(resolution.deletesToAdd());
-        baseline = current.snapshotId();
+        if (current.snapshotId() != baseline) {
+          PositionDeleteConflictResolver.Resolution resolution =
+              resolver.resolve(baseline, current, deletesToRemove, maxConflictingDeleteFiles);
+          // the resolver recomputes the planned set against the new window, so replace, not merge
+          deletesToRemove = DeleteFileSet.of(resolution.deletesToRemove());
+          deletesToAdd.addAll(resolution.deletesToAdd());
+          baseline = current.snapshotId();
 
-        if (resolution.conflictingDeleteFiles() > 0) {
-          LOG.info(
-              "Attempt {}: rebased {} concurrent delete files, validating from snapshot {}",
-              attempt,
-              resolution.conflictingDeleteFiles(),
-              baseline);
+          if (resolution.conflictingDeleteFiles() > 0) {
+            LOG.info(
+                "Attempt {}: rebased {} concurrent delete files, validating from snapshot {}",
+                attempt,
+                resolution.conflictingDeleteFiles(),
+                baseline);
+          }
+        }
+
+        RewriteFiles rewrite = newRewrite(baseline);
+        rewrittenDataFiles.forEach(rewrite::deleteFile);
+        addedDataFiles.forEach(rewrite::addFile);
+        deletesToRemove.forEach(rewrite::deleteFile);
+        deletesToAdd.forEach(rewrite::addFile);
+
+        try {
+          if (beforeCommitHook != null) {
+            // part of the attempt: a ValidationException from the hook counts as a failed commit
+            beforeCommitHook.run();
+          }
+
+          rewrite.commit();
+          return;
+        } catch (ValidationException e) {
+          LOG.warn("Attempt {} to commit rewrite failed validation, retrying", attempt, e);
+          lastFailure = e;
         }
       }
 
-      RewriteFiles rewrite = newRewrite(baseline);
-      rewrittenDataFiles.forEach(rewrite::deleteFile);
-      addedDataFiles.forEach(rewrite::addFile);
-      deletesToRemove.forEach(rewrite::deleteFile);
-      deletesToAdd.forEach(rewrite::addFile);
+      throw new ValidationException(
+          lastFailure,
+          "Cannot commit rewrite after %s attempts to rebase concurrent deletes",
+          maxConflictRetries);
+    } catch (CommitStateUnknownException e) {
+      // the commit may have succeeded; the rebased DVs may be referenced by a live snapshot
+      throw e;
+    } catch (RuntimeException e) {
+      // definitive failure: nothing references the rebased DVs, so they would otherwise leak.
+      // The rewrite's data files are cleaned up by the caller through abortFileGroup.
+      deleteRebasedDeleteFiles(deletesToAdd);
+      throw e;
+    }
+  }
 
-      try {
-        if (beforeCommitHook != null) {
-          // part of the attempt: a ValidationException from the hook counts as a failed commit
-          beforeCommitHook.run();
-        }
-
-        rewrite.commit();
-        return;
-      } catch (ValidationException e) {
-        LOG.warn("Attempt {} to commit rewrite failed validation, retrying", attempt, e);
-        lastFailure = e;
-      }
+  private void deleteRebasedDeleteFiles(List<DeleteFile> deleteFiles) {
+    if (deleteFiles.isEmpty()) {
+      return;
     }
 
-    throw new ValidationException(
-        lastFailure,
-        "Cannot commit rewrite after %s attempts to rebase concurrent deletes",
-        maxConflictRetries);
+    // several DVs usually share one Puffin file; delete each physical file once
+    Set<String> locations = Sets.newLinkedHashSet();
+    deleteFiles.forEach(file -> locations.add(file.location()));
+    LOG.info("Cleaning up {} rebased delete files after failed rewrite commit", locations.size());
+    Tasks.foreach(locations)
+        .noRetry()
+        .suppressFailureWhenFinished()
+        .onFailure((location, exc) -> LOG.warn("Failed to delete: {}", location, exc))
+        .run(table.io()::deleteFile);
   }
 
   private RewriteFiles newRewrite(long validateFromSnapshotId) {

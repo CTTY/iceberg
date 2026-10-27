@@ -30,6 +30,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import java.util.stream.LongStream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.DataFile;
@@ -440,6 +441,166 @@ public class TestRewriteDataFilesConflictResolution extends TestBase {
     assertMapMatchesLayout(table, groups, keysBySourcePosition, expectedDeletedKeys);
   }
 
+  /**
+   * One transaction deleting from two source files writes both DVs into the same Puffin file; they
+   * share a location and differ only by offset. Both must be rebased.
+   */
+  @Test
+  public void testMultipleDVsInOnePuffinFile() throws IOException {
+    Table table = createTable(3);
+    writeRecords(table, 2, 200);
+    long startingSnapshotId = table.currentSnapshot().snapshotId();
+    List<DataFile> sourceFiles = dataFiles(table);
+    DataFile d0 = sourceFiles.get(0);
+    DataFile d1 = sourceFiles.get(1);
+    Map<String, Map<Long, String>> keysBySourcePosition = keysByFileAndPosition(table);
+
+    Set<RewriteFileGroup> groups = prepareRewrite(table, startingSnapshotId);
+
+    List<Long> deletedInD0 = Lists.newArrayList(0L, 7L, 13L);
+    List<Long> deletedInD1 = Lists.newArrayList(3L, 4L, 5L, 49L);
+    commitDVs(table, ImmutableMap.of(d0, deletedInD0, d1, deletedInD1));
+    List<DeleteFile> concurrentDVs = deleteFiles(table);
+    assertThat(concurrentDVs).hasSize(2);
+    assertThat(concurrentDVs.stream().map(ContentFile::location).distinct())
+        .as("both DVs must share one Puffin file for this test to be meaningful")
+        .hasSize(1);
+
+    Set<String> expectedKeys = allKeys(keysBySourcePosition);
+    deletedInD0.forEach(
+        pos -> expectedKeys.remove(keysBySourcePosition.get(d0.location()).get(pos)));
+    deletedInD1.forEach(
+        pos -> expectedKeys.remove(keysBySourcePosition.get(d1.location()).get(pos)));
+
+    commitManager(table, startingSnapshotId, true).commitFileGroups(groups);
+
+    assertThat(currentKeys(table)).isEqualTo(expectedKeys);
+    assertThat(deleteFiles(table).stream().mapToLong(ContentFile::recordCount).sum())
+        .isEqualTo(deletedInD0.size() + deletedInD1.size());
+  }
+
+  /**
+   * Two DVs share a Puffin file; a later transaction replaces only one of them. The untouched DV in
+   * the same Puffin file must not be treated as removed.
+   */
+  @Test
+  public void testReplacingOneDVKeepsSiblingInSamePuffinFile() throws IOException {
+    Table table = createTable(3);
+    writeRecords(table, 2, 200);
+    long startingSnapshotId = table.currentSnapshot().snapshotId();
+    List<DataFile> sourceFiles = dataFiles(table);
+    DataFile d0 = sourceFiles.get(0);
+    DataFile d1 = sourceFiles.get(1);
+    Map<String, Map<Long, String>> keysBySourcePosition = keysByFileAndPosition(table);
+
+    Set<RewriteFileGroup> groups = prepareRewrite(table, startingSnapshotId);
+
+    // T1: DV_A (d0) and DV_B (d1) in one Puffin file
+    List<Long> deletedInD0 = Lists.newArrayList(1L, 2L);
+    List<Long> deletedInD1 = Lists.newArrayList(10L, 20L);
+    commitDVs(table, ImmutableMap.of(d0, deletedInD0, d1, deletedInD1));
+    String sharedPuffin =
+        Iterables.getOnlyElement(
+            deleteFiles(table).stream().map(ContentFile::location).collect(Collectors.toSet()));
+
+    // T2: replaces DV_A with a superset; DV_B stays live in the shared Puffin file
+    List<Long> replacedInD0 = Lists.newArrayList(1L, 2L, 3L);
+    commitDV(table, d0, replacedInD0);
+    assertThat(deleteFiles(table).stream().map(ContentFile::location))
+        .as("DV_B still references the shared Puffin file")
+        .contains(sharedPuffin);
+
+    Set<String> expectedKeys = allKeys(keysBySourcePosition);
+    replacedInD0.forEach(
+        pos -> expectedKeys.remove(keysBySourcePosition.get(d0.location()).get(pos)));
+    deletedInD1.forEach(
+        pos -> expectedKeys.remove(keysBySourcePosition.get(d1.location()).get(pos)));
+
+    commitManager(table, startingSnapshotId, true).commitFileGroups(groups);
+
+    assertThat(currentKeys(table)).isEqualTo(expectedKeys);
+    assertThat(deleteFiles(table).stream().mapToLong(ContentFile::recordCount).sum())
+        .isEqualTo(replacedInD0.size() + deletedInD1.size());
+  }
+
+  /**
+   * A source file whose rows are all deleted at S0 contributes nothing to the output and has no
+   * runs. A concurrent DV against it is a no-op and must not fail the rewrite.
+   */
+  @Test
+  public void testSourceFileWithNoSurvivingRows() throws IOException {
+    Table table = createTable(3);
+    writeRecords(table, 2, 200);
+    List<DataFile> sourceFiles = dataFiles(table);
+    DataFile fullyDeleted = sourceFiles.get(0);
+    DataFile other = sourceFiles.get(1);
+    Map<String, Map<Long, String>> keysBySourcePosition = keysByFileAndPosition(table);
+
+    // delete every row of the first file before the rewrite starts
+    List<Long> allPositions =
+        LongStream.range(0, fullyDeleted.recordCount()).boxed().collect(Collectors.toList());
+    commitDV(table, fullyDeleted, allPositions);
+    long startingSnapshotId = table.currentSnapshot().snapshotId();
+    Set<String> expectedKeys = currentKeys(table);
+
+    Set<RewriteFileGroup> groups =
+        prepareRewrite(
+            table,
+            startingSnapshotId,
+            ImmutableMap.of(SizeBasedFileRewritePlanner.REWRITE_ALL, "true"));
+    assertThat(groups.stream().flatMap(g -> g.rewrittenFiles().stream()).map(ContentFile::location))
+        .as("planner must include the fully deleted file")
+        .contains(fullyDeleted.location());
+    CompactionMap map =
+        CompactionMap.of(
+            groups.stream().flatMap(g -> g.positionRuns().stream()).collect(Collectors.toList()));
+    assertThat(map.containsSource(fullyDeleted.location())).isFalse();
+    assertThat(map.containsSource(other.location())).isTrue();
+
+    // a writer that read an older snapshot replaces the DV on the fully deleted file (superset)
+    commitDV(table, fullyDeleted, allPositions);
+    // and a real delete on the other file, so the window has something to rebase
+    List<Long> deletedInOther = Lists.newArrayList(5L);
+    commitDV(table, other, deletedInOther);
+    deletedInOther.forEach(
+        pos -> expectedKeys.remove(keysBySourcePosition.get(other.location()).get(pos)));
+
+    commitManager(table, startingSnapshotId, true).commitFileGroups(groups);
+
+    assertThat(currentKeys(table)).isEqualTo(expectedKeys);
+    List<DeleteFile> liveDeletes = deleteFiles(table);
+    assertThat(liveDeletes).hasSize(1);
+    assertThat(liveDeletes.get(0).recordCount()).isEqualTo(1);
+  }
+
+  /** Rebased DV files written during a definitively failed commit must not be left behind. */
+  @Test
+  public void testRebasedDVsCleanedUpOnDefinitiveFailure() throws IOException {
+    Table table = createTable(3);
+    writeRecords(table, 2, 200);
+    long startingSnapshotId = table.currentSnapshot().snapshotId();
+    DataFile d0 = dataFiles(table).get(0);
+
+    Set<RewriteFileGroup> groups = prepareRewrite(table, startingSnapshotId);
+    commitDV(table, d0, Lists.newArrayList(1L, 2L));
+    Set<String> filesBefore = dataDirectoryFiles();
+
+    RewriteDataFilesCommitManager commitManager = commitManager(table, startingSnapshotId, true);
+    commitManager.beforeCommitAttempt(
+        () -> {
+          throw new ValidationException("injected definitive failure");
+        });
+
+    assertThatThrownBy(() -> commitManager.commitFileGroups(groups))
+        .isInstanceOf(ValidationException.class);
+
+    // the only new physical files allowed are none: the rebased Puffin must have been removed
+    Set<String> newFiles = Sets.difference(dataDirectoryFiles(), filesBefore);
+    assertThat(newFiles.stream().filter(name -> name.endsWith(".puffin")))
+        .as("rebased DV Puffin files must be cleaned up")
+        .isEmpty();
+  }
+
   /** Equality deletes commute with the rewrite because output files keep the starting sequence. */
   @Test
   public void testEqualityDeleteCommittedDuringRewrite() throws IOException {
@@ -680,24 +841,37 @@ public class TestRewriteDataFilesConflictResolution extends TestBase {
   }
 
   private void commitDV(Table table, DataFile dataFile, List<Long> positions) {
+    commitDVs(table, ImmutableMap.of(dataFile, positions));
+  }
+
+  /**
+   * Commits one DV per data file in a single transaction. Like a real engine write, all DVs land in
+   * the same Puffin file and differ only by content offset.
+   */
+  private void commitDVs(Table table, Map<DataFile, List<Long>> positionsByFile) {
     OutputFileFactory fileFactory =
         OutputFileFactory.builderFor(table, 1, 1).format(FileFormat.PUFFIN).build();
     DVFileWriter writer = new BaseDVFileWriter(fileFactory, path -> null);
     try (DVFileWriter closeable = writer) {
-      for (long pos : positions) {
-        closeable.delete(dataFile.location(), pos, table.spec(), dataFile.partition());
+      for (Map.Entry<DataFile, List<Long>> entry : positionsByFile.entrySet()) {
+        DataFile dataFile = entry.getKey();
+        for (long pos : entry.getValue()) {
+          closeable.delete(dataFile.location(), pos, table.spec(), dataFile.partition());
+        }
       }
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
 
+    Set<String> referenced =
+        positionsByFile.keySet().stream().map(ContentFile::location).collect(Collectors.toSet());
     table.refresh();
     org.apache.iceberg.RowDelta rowDelta =
         table.newRowDelta().validateFromSnapshot(table.currentSnapshot().snapshotId());
     writer.result().deleteFiles().forEach(rowDelta::addDeletes);
     // v3 writers replace the existing DV of a data file rather than adding a second one
     deleteFiles(table).stream()
-        .filter(dv -> dataFile.location().equals(dv.referencedDataFile()))
+        .filter(dv -> referenced.contains(dv.referencedDataFile()))
         .forEach(rowDelta::removeDeletes);
     rowDelta.commit();
   }
@@ -752,6 +926,23 @@ public class TestRewriteDataFilesConflictResolution extends TestBase {
               Comparator.comparing((DeleteFile df) -> df.location())
                   .thenComparingLong(df -> df.contentOffset()))
           .collect(Collectors.toList());
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private Set<String> dataDirectoryFiles() {
+    File dataDir = new File(tableDir, "data");
+    if (!dataDir.exists()) {
+      return Sets.newHashSet();
+    }
+
+    try (java.util.stream.Stream<java.nio.file.Path> paths =
+        java.nio.file.Files.walk(dataDir.toPath())) {
+      return paths
+          .filter(java.nio.file.Files::isRegularFile)
+          .map(path -> path.getFileName().toString())
+          .collect(Collectors.toSet());
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
